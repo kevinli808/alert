@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+mlruns/
+*.wav
+*.webm
+*.mp3
+!tests/fixtures/**
+eval_data/
