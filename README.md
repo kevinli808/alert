@@ -1,1 +1,2 @@
-# repo-template
+# alert
+Hack Camp 2026 Submission 
