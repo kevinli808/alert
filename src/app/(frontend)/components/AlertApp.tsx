@@ -618,8 +618,8 @@ function HelpContent() {
         <h3>Customisation</h3>
         <p>
           Use Menu to connect sounds to colour states, vibration, and text-to-speech responses.
-          Speech recognition and classification require a compatible detection integration; demo
-          tests are always labeled.
+          Phrases are recognised by the browser's speech recognition (Chrome and Edge); demo tests
+          are always labeled.
         </p>
       </section>
     </div>
@@ -892,7 +892,7 @@ function NodeEditor(props: EditorProps) {
               }
               placeholder="Text Alert should speak"
             />
-            <small>Generated after a compatible detector recognizes this input.</small>
+            <small>Spoken aloud by this device when this sound or phrase is detected.</small>
           </label>
         )}
         {selected?.effects.includes('smart-lights') && (
@@ -1263,6 +1263,11 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     null,
   )
   const lastScoresRef = useRef<{ at: number; scores: Record<string, number> } | null>(null)
+  // Text-to-speech: while the app is speaking (and briefly after), phrase recognition ignores what it
+  // hears, so a reply such as "Help is on the way" cannot trigger the "Help" phrase again.
+  const speakingUntilRef = useRef(0)
+  const lastSpokenRef = useRef(new Map<string, number>())
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
   const detectPausedUntilRef = useRef(0)
   const micSessionRef = useRef(0)
   // True while the server says the model is still starting (e.g. Databricks waking from scale-to-zero).
@@ -1734,6 +1739,40 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   }
   useEffect(() => stopMicrophone, [stopMicrophone])
 
+  const speakResponse = useCallback((rule: SoundRule, live: boolean) => {
+    // Reads the rule's response aloud with the browser's built-in voice (all major browsers).
+    const text = rule.ttsResponse?.trim()
+    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) return
+    const now = Date.now()
+    // Live detections speak at most once per rule every 4 s (a sound that keeps going does not
+    // re-trigger at all); the menu's Test button always speaks.
+    if (live && now - (lastSpokenRef.current.get(rule.id) ?? 0) < 4_000) return
+    lastSpokenRef.current.set(rule.id, now)
+    const synth = window.speechSynthesis
+    // No `lang`: the browser's default voice reads any language; forcing the UI language can pick a
+    // voice that is not installed and stay silent.
+    const utterance = new SpeechSynthesisUtterance(text)
+    utteranceRef.current = utterance // Chrome can drop an utterance that is garbage-collected mid-speech
+    // Ignore heard phrases from now until shortly after speaking ends. The timeout is a fallback for
+    // browsers that never fire `end` (long or interrupted utterances).
+    const fallback = now + 4000 + text.length * 120
+    speakingUntilRef.current = Math.max(speakingUntilRef.current, fallback)
+    const finished = () => {
+      speakingUntilRef.current = Date.now() + 1500
+    }
+    utterance.onend = finished
+    utterance.onerror = finished
+    // The newest alert replaces anything still playing or queued. This also clears Chrome/Edge's
+    // known stuck-queue state, where new speech waits forever behind an old utterance.
+    const busy = synth.speaking || synth.pending
+    if (busy) synth.cancel()
+    synth.resume() // Chrome can be left paused, which silently queues everything
+    // Speaking right after cancel() is dropped by Chrome/Edge, so give the cancel a moment.
+    if (busy) window.setTimeout(() => synth.speak(utterance), 120)
+    else synth.speak(utterance)
+  }, [])
+  useEffect(() => () => window.speechSynthesis?.cancel(), [])
+
   const triggerRule = useCallback(
     (id: string, live?: { confidence: number }) => {
       const rule = rules.find((item) => item.id === id)
@@ -1760,12 +1799,13 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       )
       if (visualEffect) enqueueAlert(visualEffect, rule.label)
       if (rule.effects.includes('vibration') && navigator.vibrate) navigator.vibrate([120, 70, 120])
+      if (rule.effects.includes('tts')) speakResponse(rule, Boolean(live))
       if (!simpleRef.current) {
         setAudioLevel(0.72)
         window.setTimeout(() => setAudioLevel(0.04), 900)
       }
     },
-    [enqueueAlert, rules, statePriority, states],
+    [enqueueAlert, rules, speakResponse, statePriority, states],
   )
   const sustainRule = useCallback(
     (id: string, live: { confidence: number }) => {
@@ -1837,6 +1877,7 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       r.interimResults = true // react while the word is still being spoken
       r.lang = navigator.language || 'en-US'
       r.onresult = (event) => {
+        if (Date.now() < speakingUntilRef.current) return // the app's own spoken reply
         for (let i = event.resultIndex; i < event.results.length; i += 1) {
           const best = event.results[i][0]
           if (!best) continue
