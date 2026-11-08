@@ -922,6 +922,7 @@
   padding: 5px 14px 14px;
   overflow: auto;
   scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 .effect-group h3 {
   margin: 12px 0 7px;
