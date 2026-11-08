@@ -92,7 +92,7 @@ Session management means the SPA SDK refreshes tokens and logout clears the Auth
 1. Open Dashboard → **SQL Editor**, paste [sql/schema.sql](sql/schema.sql) and run it. The script is
    safe to re-run. It creates:
    - `profiles` (id = Auth0 `sub`)
-   - `alert_preferences` (unique on user + sound type; colour checked against `#RRGGBB`; `flash_speed` 1–3)
+   - `user_settings` (one JSON document per user: the frontend's sound rules, visual states and priority order)
    - `alert_history` (indexed on `user_id, detected_at desc`)
    - an `updated_at` trigger
    - **RLS enabled on every table**, with nothing granted to `anon`
@@ -205,10 +205,10 @@ at `/docs`.
 | Method | Path | Purpose | Notes |
 |---|---|---|---|
 | GET | `/health` | Model, auth and DB status | public |
-| GET | `/api/sound-types` | Categories, default colours, thresholds | public |
+| GET | `/api/sound-types` | Detectable categories and thresholds | public |
 | GET | `/api/users/me` | Current profile (created on first call) | |
-| GET | `/api/preferences` | One preference per sound type (saved or default) | `is_default` flag |
-| PUT | `/api/preferences` | Upsert the listed sound types | body `{"preferences":[{sound_type,color,enabled,flash_speed}]}` |
+| GET | `/api/settings` | The user's saved alert settings | `settings: null` until first save |
+| PUT | `/api/settings` | Replace the user's alert settings | body `{"settings":{simple,rules,customStates,stateOrder,introComplete}}` (the frontend's model; unknown fields rejected) |
 | POST | `/api/detect-sound` | Classify one chunk | multipart field `audio`; 0.5–10 s; ≤2 MB |
 | GET | `/api/alert-history` | Detected events, newest first | `?limit=50&before=<iso>` |
 | DELETE | `/api/alert-history` | Delete the user's history | 204 |
@@ -230,10 +230,10 @@ API=http://localhost:8000
 
 curl $API/api/users/me -H "Authorization: Bearer $TOKEN"
 
-curl $API/api/preferences -H "Authorization: Bearer $TOKEN"
+curl $API/api/settings -H "Authorization: Bearer $TOKEN"
 
-curl -X PUT $API/api/preferences -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"preferences":[{"sound_type":"doorbell","color":"#0000FF","enabled":true,"flash_speed":1}]}'
+curl -X PUT $API/api/settings -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"settings":{"simple":false,"rules":[{"id":"doorbell","label":"Doorbell","kind":"sound","enabled":true,"effects":["warning"]}],"customStates":[],"stateOrder":["urgent","warning","default"],"introComplete":true}}'
 
 curl -X POST $API/api/detect-sound -H "Authorization: Bearer $TOKEN" -F "audio=@doorbell.wav;type=audio/wav"
 
@@ -250,7 +250,8 @@ RUN_MODEL_TESTS=1 pytest -s tests/test_yamnet_integration.py   # real YAMNet + l
 The tests cover:
 - JWT validation: expiry, audience, issuer, unknown key, forged signature, HS256 algorithm confusion
 - per-user data isolation, and rejection of a `user_id` in the request body
-- preference validation, including the 3 Hz flash cap
+- settings validation (field allowlist, ids, colours, state references)
+- token-less detection only in local development without Auth0, never storing history
 - audio decoding: stereo/44.1 kHz → mono/16 kHz, corrupt, empty, too long/short, silence
 - threshold, priority and cooldown logic, and invalid model output
 - history pagination and deletion

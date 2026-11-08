@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import detection, history, preferences, users
+from app.api import detection, history, settings as settings_api, users
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.security import install_http_middleware
@@ -28,6 +28,8 @@ def create_app(settings: Settings | None = None, services: ServiceContainer | No
     settings = settings or get_settings()
     settings.validate_for_startup()
     logging.basicConfig(level=settings.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if settings.anonymous_detection_enabled:
+        logger.warning("Auth0 not configured: /api/detect-sound accepts requests without a token (dev only)")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
@@ -62,7 +64,7 @@ def create_app(settings: Settings | None = None, services: ServiceContainer | No
     register_exception_handlers(app)
 
     app.include_router(users.router)
-    app.include_router(preferences.router)
+    app.include_router(settings_api.router)
     app.include_router(detection.router)
     app.include_router(history.router)
 
@@ -74,6 +76,8 @@ def create_app(settings: Settings | None = None, services: ServiceContainer | No
             "status": "ok" if model_status == "ready" else "degraded",
             "model": {"provider": c.detection.classifier.name, "status": model_status},
             "auth_configured": c.token_verifier is not None,
+            # True when the frontend may call /api/detect-sound without logging in (local dev only).
+            "anonymous_detection": c.settings.anonymous_detection_enabled,
             "database_configured": c.database is not None,
         }
 

@@ -11,7 +11,7 @@ def test_health(client):
 
 def test_cors_preflight_allows_frontend_origin(client):
     resp = client.options(
-        "/api/preferences",
+        "/api/settings",
         headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "PUT",
                  "Access-Control-Request-Headers": "authorization,content-type"},
     )
@@ -21,7 +21,7 @@ def test_cors_preflight_allows_frontend_origin(client):
 
 def test_cors_rejects_unknown_origin(client):
     resp = client.options(
-        "/api/preferences",
+        "/api/settings",
         headers={"Origin": "https://evil.example.com", "Access-Control-Request-Method": "GET"},
     )
     assert "access-control-allow-origin" not in resp.headers
@@ -36,42 +36,60 @@ def test_users_me_creates_profile_once(client, auth_headers, db):
     assert len(db.profiles) == 1
 
 
-def test_preferences_defaults_then_update(client, auth_headers):
-    h = auth_headers()
-    prefs = client.get("/api/preferences", headers=h).json()["preferences"]
-    door = next(p for p in prefs if p["sound_type"] == "doorbell")
-    assert door["is_default"] is True and door["updated_at"] is None
+FRONTEND_SETTINGS = {  # shape of StoredSettings in src/components/AlertApp.tsx
+    "simple": False,
+    "rules": [
+        {"id": "doorbell", "label": "Doorbell", "kind": "sound", "enabled": True, "effects": ["warning", "vibration"]},
+        {"id": "phrase-1", "label": "Watch out", "kind": "phrase", "enabled": True, "effects": ["custom-1", "tts"],
+         "ttsResponse": "On my way", "lightColor": "#2DD4BF"},
+    ],
+    "customStates": [{"id": "custom-1", "name": "Information", "color": "#4F7FD8", "priority": 1, "duration": 4000}],
+    "stateOrder": ["urgent", "custom-1", "warning", "default"],
+    "introComplete": True,
+}
 
-    resp = client.put(
-        "/api/preferences",
-        headers=h,
-        json={"preferences": [{"sound_type": "doorbell", "color": "#00ff00", "enabled": False, "flash_speed": 2}]},
-    )
+
+def test_settings_empty_then_saved_round_trip(client, auth_headers):
+    h = auth_headers()
+    first = client.get("/api/settings", headers=h).json()
+    assert first == {"settings": None, "updatedAt": None}
+
+    resp = client.put("/api/settings", headers=h, json={"settings": FRONTEND_SETTINGS})
     assert resp.status_code == 200
-    door = next(p for p in resp.json()["preferences"] if p["sound_type"] == "doorbell")
-    assert door == {**door, "color": "#00FF00", "enabled": False, "flash_speed": 2, "is_default": False}
-    assert len(resp.json()["preferences"]) == len(prefs)  # still one entry per sound type
+    assert resp.json()["settings"] == FRONTEND_SETTINGS  # stored and returned in the frontend's own shape
+    again = client.get("/api/settings", headers=h).json()
+    assert again["settings"] == FRONTEND_SETTINGS and again["updatedAt"]
 
 
-def test_preferences_are_isolated_per_user(client, auth_headers):
-    client.put("/api/preferences", headers=auth_headers("auth0|alice"),
-               json={"preferences": [{"sound_type": "doorbell", "color": "#123456"}]})
-    bob = client.get("/api/preferences", headers=auth_headers("auth0|bob")).json()["preferences"]
-    assert next(p for p in bob if p["sound_type"] == "doorbell")["is_default"] is True
+def test_settings_are_isolated_per_user(client, auth_headers, db):
+    client.put("/api/settings", headers=auth_headers("auth0|alice"), json={"settings": FRONTEND_SETTINGS})
+    assert client.get("/api/settings", headers=auth_headers("auth0|bob")).json()["settings"] is None
+    assert set(db.settings) == {"auth0|alice"}
 
 
-def test_preferences_validation(client, auth_headers):
-    h = auth_headers()
+def test_settings_validation(client, auth_headers):
+    import copy
+
+    def variant(mutate):
+        body = copy.deepcopy(FRONTEND_SETTINGS)
+        mutate(body)
+        return {"settings": body}
+
     bad_bodies = [
-        {"preferences": [{"sound_type": "doorbell", "color": "blue"}]},
-        {"preferences": [{"sound_type": "not_a_sound", "color": "#000000"}]},
-        {"preferences": [{"sound_type": "doorbell", "color": "#000000", "flash_speed": 10}]},  # > 3 Hz
-        {"preferences": [{"sound_type": "doorbell", "color": "#000000", "user_id": "auth0|victim"}]},
-        {"preferences": [{"sound_type": "doorbell", "color": "#000000"}] * 2},
-        {"preferences": []},
+        variant(lambda b: b.update(userId="auth0|victim")),  # unknown fields are rejected
+        variant(lambda b: b["rules"][0].update(kind="music")),
+        variant(lambda b: b["rules"].append(dict(b["rules"][0]))),  # duplicate rule id
+        variant(lambda b: b["rules"][0]["effects"].append("<script>")),
+        variant(lambda b: b["customStates"][0].update(color="blue")),
+        variant(lambda b: b["customStates"][0].update(id="urgent")),  # can't overwrite a system state
+        variant(lambda b: b["customStates"][0].update(duration=10**9)),
+        variant(lambda b: b["stateOrder"].append("ghost")),  # unknown state in the priority list
+        {"settings": {"rules": "nope"}},
+        {},
     ]
+    h = auth_headers()
     for body in bad_bodies:
-        resp = client.put("/api/preferences", headers=h, json=body)
+        resp = client.put("/api/settings", headers=h, json=body)
         assert resp.status_code == 422, body
         assert resp.json()["error"]["code"] == "validation_error"
 
@@ -165,9 +183,9 @@ def test_rate_limit(settings, container, auth_headers):
     settings.rate_limit_default_per_minute = 2
     with TestClient(create_app(settings, container)) as c:
         h = auth_headers()
-        assert c.get("/api/preferences", headers=h).status_code == 200
-        assert c.get("/api/preferences", headers=h).status_code == 200
-        resp = c.get("/api/preferences", headers=h)
+        assert c.get("/api/settings", headers=h).status_code == 200
+        assert c.get("/api/settings", headers=h).status_code == 200
+        resp = c.get("/api/settings", headers=h)
         assert resp.status_code == 429 and int(resp.headers["retry-after"]) >= 1
 
 
@@ -180,5 +198,41 @@ def test_sound_types_public(client):
 def test_openapi_docs(client):
     assert client.get("/docs").status_code == 200
     paths = client.get("/openapi.json").json()["paths"]
-    for p in ["/api/users/me", "/api/preferences", "/api/detect-sound", "/api/alert-history"]:
+    for p in ["/api/users/me", "/api/settings", "/api/detect-sound", "/api/alert-history"]:
         assert p in paths
+
+
+# ------------------------------------------------- local dev: anonymous detection ----------
+def _anon_client(settings, container, **overrides):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    for key, value in overrides.items():
+        setattr(settings, key, value)
+    if not settings.auth0_configured:
+        container.token_verifier = None
+    return TestClient(create_app(settings, container))
+
+
+def test_anonymous_detection_in_development_without_auth0(settings, container, classifier, db):
+    classifier.set(doorbell=0.9)
+    with _anon_client(settings, container, environment="development", auth0_domain="", auth0_audience="") as c:
+        assert c.get("/health").json()["anonymous_detection"] is True
+        resp = c.post("/api/detect-sound", files={"audio": ("c.wav", wav_bytes(), "audio/wav")})
+        assert resp.status_code == 200 and resp.json()["sound_type"] == "doorbell"
+        assert db.history == []  # anonymous detections are never stored
+        # Everything else still needs a real login.
+        assert c.get("/api/settings").status_code == 401
+
+
+def test_anonymous_detection_refused_when_auth0_configured(settings, container):
+    with _anon_client(settings, container, environment="development") as c:
+        assert c.get("/health").json()["anonymous_detection"] is False
+        resp = c.post("/api/detect-sound", files={"audio": ("c.wav", wav_bytes(), "audio/wav")})
+        assert resp.status_code == 401
+
+
+def test_anonymous_detection_refused_outside_development(settings, container):
+    with _anon_client(settings, container, auth0_domain="", auth0_audience="") as c:  # environment="test"
+        resp = c.post("/api/detect-sound", files={"audio": ("c.wav", wav_bytes(), "audio/wav")})
+        assert resp.status_code == 401

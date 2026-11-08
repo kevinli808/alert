@@ -32,11 +32,28 @@ def get_current_user(
     return services.token_verifier.verify(credentials.credentials)
 
 
+ANONYMOUS_USER_ID = "dev|anonymous"
+ANONYMOUS_DEV_USER = AuthenticatedUser(user_id=ANONYMOUS_USER_ID)
+
+
+def get_detection_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    services: ServiceContainer = Depends(get_services),
+) -> AuthenticatedUser:
+    """Like get_current_user, but allows token-less local development (see allow_anonymous_detection)."""
+    # In this mode Auth0 isn't configured, so a token (e.g. from a logged-in frontend) can't be
+    # verified anyway; treat every caller as the anonymous dev user rather than failing.
+    if services.settings.anonymous_detection_enabled:
+        return ANONYMOUS_DEV_USER
+    return get_current_user(credentials, services)
+
+
 def rate_limit(bucket: str, *, detection: bool = False):  # type: ignore[no-untyped-def]
     """Build a dependency that rate-limits the authenticated user for a given bucket."""
+    user_dependency = get_detection_user if detection else get_current_user
 
     def _dependency(
-        user: AuthenticatedUser = Depends(get_current_user),
+        user: AuthenticatedUser = Depends(user_dependency),
         services: ServiceContainer = Depends(get_services),
     ) -> None:
         settings = services.settings

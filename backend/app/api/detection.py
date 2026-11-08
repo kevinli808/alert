@@ -6,7 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.core.errors import PayloadTooLargeError, UnsupportedMediaTypeError
-from app.dependencies.auth import get_current_user, rate_limit
+from app.dependencies.auth import ANONYMOUS_USER_ID, get_detection_user, rate_limit
 from app.dependencies.services import get_services
 from app.schemas.common import error_responses
 from app.schemas.detection import (
@@ -63,7 +63,7 @@ def list_sound_types(services: ServiceContainer = Depends(get_services)) -> Soun
 async def detect_sound(
     background: BackgroundTasks,
     audio: UploadFile = File(..., description="Audio chunk (WAV/FLAC/OGG; WebM/MP4 if ffmpeg is installed)"),
-    user: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_detection_user),
     _rl: None = Depends(rate_limit("detect", detection=True)),
     services: ServiceContainer = Depends(get_services),
 ) -> DetectionResponse:
@@ -83,6 +83,7 @@ async def detect_sound(
     if (
         outcome.detected
         and outcome.is_new_event
+        and user.user_id != ANONYMOUS_USER_ID  # local dev mode: nothing to attach history to
         and services.database is not None
         and services.settings.record_history
     ):

@@ -50,13 +50,13 @@ def test_rejects_garbage(verifier):
 
 
 def test_protected_endpoint_requires_token(client):
-    resp = client.get("/api/preferences")
+    resp = client.get("/api/settings")
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "unauthorized"
     assert resp.headers["www-authenticate"] == "Bearer"
 
 
 def test_protected_endpoint_rejects_expired_token(client, make_token):
-    resp = client.get("/api/preferences", headers={"Authorization": f"Bearer {make_token(exp=1)}"})
+    resp = client.get("/api/settings", headers={"Authorization": f"Bearer {make_token(exp=1)}"})
     assert resp.status_code == 401
     assert "expired" in resp.json()["error"]["message"]

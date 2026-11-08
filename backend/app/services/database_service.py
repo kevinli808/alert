@@ -18,7 +18,7 @@ from app.core.errors import DatabaseError
 
 logger = logging.getLogger(__name__)
 
-PREFERENCE_COLUMNS = "sound_type,color,enabled,flash_speed,updated_at"
+SETTINGS_COLUMNS = "settings,updated_at"
 HISTORY_COLUMNS = "id,sound_type,confidence,detected_at"
 PROFILE_COLUMNS = "id,email,username,created_at"
 
@@ -35,10 +35,11 @@ class Database(ABC):
     ) -> dict[str, Any]: ...
 
     @abstractmethod
-    async def list_preferences(self, user_id: str) -> list[dict[str, Any]]: ...
+    async def get_settings(self, user_id: str) -> dict[str, Any] | None:
+        """Return {"settings": <json>, "updated_at": ...} or None if the user never saved settings."""
 
     @abstractmethod
-    async def upsert_preferences(self, user_id: str, preferences: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
+    async def upsert_settings(self, user_id: str, settings: dict[str, Any]) -> dict[str, Any]: ...
 
     @abstractmethod
     async def insert_alert_history(
@@ -117,34 +118,30 @@ class SupabaseDatabase(Database):
             raise DatabaseError("Could not create user profile")
         return existing
 
-    # --- alert_preferences ---------------------------------------------------------------
-    async def list_preferences(self, user_id: str) -> list[dict[str, Any]]:
-        return await self._request(
+    # --- user_settings -------------------------------------------------------------------
+    async def get_settings(self, user_id: str) -> dict[str, Any] | None:
+        rows = await self._request(
             "GET",
-            "alert_preferences",
-            params={"select": PREFERENCE_COLUMNS, "user_id": f"eq.{user_id}", "order": "sound_type.asc"},
-        ) or []
+            "user_settings",
+            params={"select": SETTINGS_COLUMNS, "user_id": f"eq.{user_id}", "limit": "1"},
+        )
+        return rows[0] if rows else None
 
-    async def upsert_preferences(self, user_id: str, preferences: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        now = datetime.now(timezone.utc).isoformat()
-        payload = [
-            {
-                "user_id": user_id,  # always the authenticated user â€” never taken from the request body
-                "sound_type": p["sound_type"],
-                "color": p["color"],
-                "enabled": p["enabled"],
-                "flash_speed": p["flash_speed"],
-                "updated_at": now,
-            }
-            for p in preferences
-        ]
-        return await self._request(
+    async def upsert_settings(self, user_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+        rows = await self._request(
             "POST",
-            "alert_preferences",
-            params={"on_conflict": "user_id,sound_type", "select": PREFERENCE_COLUMNS},
-            json=payload,
+            "user_settings",
+            params={"on_conflict": "user_id", "select": SETTINGS_COLUMNS},
+            json={
+                "user_id": user_id,  # always the authenticated user — never taken from the request body
+                "settings": settings,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
             prefer="resolution=merge-duplicates,return=representation",
-        ) or []
+        )
+        if not rows:
+            raise DatabaseError("Could not save settings")
+        return rows[0]
 
     # --- alert_history -------------------------------------------------------------------
     async def insert_alert_history(
