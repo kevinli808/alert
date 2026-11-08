@@ -15,7 +15,3 @@ PyJWT[crypto]>=2.8
 numpy>=1.26
 soundfile>=0.12
 librosa>=0.10.2
-
-# Sound classification (YAMNet). Python 3.9-3.12 on Windows/Linux/macOS.
-tensorflow>=2.16,<2.21
-tensorflow-hub>=0.16

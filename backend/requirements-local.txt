@@ -1,0 +1,4 @@
+# Optional large dependencies for local YAMNet inference.
+# Vercel installs requirements.txt only; it uses the configured remote model service.
+tensorflow>=2.16,<2.21
+tensorflow-hub>=0.16

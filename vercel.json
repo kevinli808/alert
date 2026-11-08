@@ -12,7 +12,31 @@
   },
   "rewrites": [
     {
-      "source": "/api/(.*)",
+      "source": "/api/detect-sound",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/api/sound-types",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/api/users/me",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/api/settings",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/api/alert-history",
       "destination": {
         "service": "backend"
       }

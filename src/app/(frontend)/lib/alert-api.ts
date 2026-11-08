@@ -1,7 +1,10 @@
 // Browser client for the FastAPI backend in /backend. No secrets live here: the URL is public config.
 
 // Empty means same-origin requests, routed to FastAPI by Vercel's /api and /health rewrites.
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '')
+export const API_URL = (
+  process.env.NEXT_PUBLIC_API_URL ??
+  (process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '')
+).replace(/\/$/, '')
 
 export type BackendHealth = {
   status: 'ok' | 'degraded'
@@ -93,7 +96,7 @@ export const putSettings = <T>(settings: T, getToken: TokenGetter) =>
 export const AUTH0_CONFIG = {
   domain: process.env.NEXT_PUBLIC_AUTH0_DOMAIN || '',
   clientId: process.env.NEXT_PUBLIC_AUTH0_CLIENT_ID || '',
-  audience: process.env.NEXT_PUBLIC_AUTH0_AUDIENCE || '',
+  audience: (process.env.NEXT_PUBLIC_AUTH0_AUDIENCE || '').replace(/\/+$/, ''),
 }
 export const AUTH0_ENABLED = Boolean(
   AUTH0_CONFIG.domain && AUTH0_CONFIG.clientId && AUTH0_CONFIG.audience,

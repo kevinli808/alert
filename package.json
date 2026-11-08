@@ -1,24 +1,25 @@
 {
-  "name": "figma-make-app",
+  "name": "alert",
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "pnpm@10.28.0",
   "scripts": {
-    "dev": "NODE_OPTIONS=--no-deprecation next dev --port ${PORT:-3000} --hostname 0.0.0.0",
-    "build": "NODE_OPTIONS=--no-deprecation payload build",
-    "start": "NODE_OPTIONS=--no-deprecation next start",
+    "dev": "next dev --port ${PORT:-3000} --hostname 0.0.0.0",
+    "build": "payload migrate && payload build",
+    "start": "next start",
     "format": "oxfmt",
-    "generate:importmap": "NODE_OPTIONS=--no-deprecation payload generate:importmap",
-    "generate:types": "NODE_OPTIONS=--no-deprecation payload generate:types",
-    "payload": "NODE_OPTIONS=--no-deprecation payload"
+    "generate:importmap": "payload generate:importmap",
+    "generate:types": "payload generate:types",
+    "payload": "payload"
   },
   "dependencies": {
     "@auth0/auth0-react": "2.30.0",
-    "@payloadcms/figma": "1.0.0-beta.1",
+    "@payloadcms/db-postgres": "4.0.0-beta.6",
     "@payloadcms/next": "4.0.0-beta.6",
-    "@payloadcms/plugin-cloud-storage": "4.0.0-beta.6",
     "@payloadcms/plugin-mcp": "4.0.0-beta.6",
     "@payloadcms/richtext-lexical": "4.0.0-beta.6",
+    "@payloadcms/storage-vercel-blob": "4.0.0-beta.6",
     "@payloadcms/translations": "4.0.0-beta.6",
     "@payloadcms/ui": "4.0.0-beta.6",
     "graphql": "^16.8.1",
@@ -41,7 +42,7 @@
     "typescript": "6.0.3"
   },
   "engines": {
-    "node": ">=24.22.1",
+    "node": "24.x",
     "pnpm": "^9 || ^10 || ^11"
   },
   "pnpm": {

@@ -40,10 +40,7 @@
   }
 }
 
-.figma-custom-code-fragment {
-  display: contents;
-}
-.figma-bypass-link {
+.skip-link {
   position: fixed;
   top: 8px;
   left: 8px;
@@ -54,7 +51,7 @@
   padding: 8px 12px;
   font-size: 13px;
 }
-.figma-bypass-link:focus {
+.skip-link:focus {
   transform: translateY(0);
 }
 
