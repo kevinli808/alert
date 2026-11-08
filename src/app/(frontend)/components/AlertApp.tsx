@@ -32,6 +32,8 @@ import {
 } from '../lib/alert-api'
 
 const CHUNK_SECONDS = 2
+// A new 2 s window every second (half overlap) so short sounds are never split between chunks.
+const CHUNK_HOP_SECONDS = 1
 
 type ListeningState = 'paused' | 'listening' | 'unavailable'
 type BackendStatus = 'checking' | 'ready' | 'loading' | 'offline' | 'login-required' | 'error'
@@ -86,6 +88,14 @@ const SYSTEM_STATES: VisualState[] = [
     system: true,
   },
   {
+    id: 'phrase',
+    name: 'Purple — Phrase',
+    color: '#a371f7',
+    priority: 1,
+    duration: 4000,
+    system: true,
+  },
+  {
     id: 'urgent',
     name: 'Red — Urgent',
     color: '#e05252',
@@ -94,7 +104,7 @@ const SYSTEM_STATES: VisualState[] = [
     system: true,
   },
 ]
-const SYSTEM_STATE_ORDER = ['urgent', 'warning', 'default']
+const SYSTEM_STATE_ORDER = ['urgent', 'phrase', 'warning', 'default']
 
 const DEFAULT_RULES: SoundRule[] = [
   { id: 'dog-barking', label: 'Dog barking', kind: 'sound', enabled: true, effects: ['warning'] },
@@ -169,6 +179,51 @@ const DEFAULT_RULES: SoundRule[] = [
   },
 ]
 
+// --------------------------------------------------------------- spoken phrases ---------
+// Phrases use the browser's built-in speech recognition (Web Speech API: Chrome and Edge, which
+// send the audio to Google / Microsoft to transcribe it). Only typed loosely here because the DOM
+// typings for it are not part of every TypeScript lib.
+type SpeechAlternative = { transcript: string; confidence: number }
+type SpeechResultEvent = {
+  resultIndex: number
+  results: ArrayLike<ArrayLike<SpeechAlternative> & { isFinal: boolean }>
+}
+type BrowserSpeechRecognition = {
+  continuous: boolean
+  interimResults: boolean
+  lang: string
+  onresult: ((event: SpeechResultEvent) => void) | null
+  onerror: ((event: { error: string }) => void) | null
+  onend: (() => void) | null
+  start: () => void
+  abort: () => void
+}
+type SpeechRecognitionConstructor = new () => BrowserSpeechRecognition
+
+function getSpeechRecognition(): SpeechRecognitionConstructor | null {
+  if (typeof window === 'undefined') return null
+  const w = window as unknown as {
+    SpeechRecognition?: SpeechRecognitionConstructor
+    webkitSpeechRecognition?: SpeechRecognitionConstructor
+  }
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null
+}
+
+/** Lower-case, punctuation removed, single spaces: "Hey, Chase!" -> "hey chase". */
+function normalizeSpeech(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}']+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** Whole-word match, so "help" matches "can you help me" but not "helpful". */
+function phraseMatches(spoken: string, phrase: string) {
+  const wanted = normalizeSpeech(phrase)
+  return wanted.length > 0 && ` ${spoken} `.includes(` ${wanted} `)
+}
+
 const ADDITIONAL_EFFECTS = [
   { id: 'vibration', name: 'Vibration', category: 'Physical feedback' },
   { id: 'tts', name: 'Text-to-speech', category: 'Additional effects' },
@@ -238,9 +293,12 @@ function normalizeSettings(saved: Partial<StoredSettings>): StoredSettings {
       ...(saved.stateOrder ?? SYSTEM_STATE_ORDER).filter((id) => allStateIds.includes(id)),
       ...allStateIds.filter((id) => !(saved.stateOrder ?? SYSTEM_STATE_ORDER).includes(id)),
     ]
+    const middle = restoredOrder.filter((id) => id !== 'urgent' && id !== 'default')
+    // Settings saved before the purple phrase state existed get it right after red.
+    const savedHadPhrase = (saved.stateOrder ?? SYSTEM_STATE_ORDER).includes('phrase')
     const stateOrder = [
       'urgent',
-      ...restoredOrder.filter((id) => id !== 'urgent' && id !== 'default'),
+      ...(savedHadPhrase ? middle : ['phrase', ...middle.filter((id) => id !== 'phrase')]),
       'default',
     ]
     const visualStateIds = new Set(allStateIds)
@@ -720,7 +778,7 @@ function NodeEditor(props: EditorProps) {
                 <b>{rule.label}</b>
                 <small>
                   {rule.kind === 'phrase'
-                    ? 'Recognized phrase · integration required'
+                    ? 'Spoken phrase · live in Chrome & Edge'
                     : LIVE_RULE_IDS.has(rule.id)
                       ? 'Environmental sound · live detection'
                       : 'Environmental sound · simulation only'}
@@ -916,7 +974,7 @@ function SimpleEditor(props: EditorProps) {
           <h3>{selected?.label}</h3>
           {selected?.kind === 'phrase' && (
             <p className="integration-note">
-              Incoming phrase recognition requires a speech-processing integration.
+              While listening, the browser's speech recognition (Chrome and Edge) listens for this phrase.
             </p>
           )}
         </div>
@@ -1201,6 +1259,10 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const triggerRuleRef = useRef<(id: string, live?: { confidence: number }) => void>(() => {})
   const sustainRuleRef = useRef<(id: string, live: { confidence: number }) => void>(() => {})
   const detectBusyRef = useRef(false)
+  const pendingChunkRef = useRef<{ samples: Float32Array; sampleRate: number; session: number } | null>(
+    null,
+  )
+  const lastScoresRef = useRef<{ at: number; scores: Record<string, number> } | null>(null)
   const detectPausedUntilRef = useRef(0)
   const micSessionRef = useRef(0)
   // True while the server says the model is still starting (e.g. Databricks waking from scale-to-zero).
@@ -1247,13 +1309,21 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     else sustainRuleRef.current(ruleId, { confidence: result.confidence })
   }, [])
 
-  const sendChunk = useCallback(
+  const detectOne = useCallback(
     async (samples: Float32Array, sampleRate: number, session: number) => {
-      // Drop chunks rather than queue them: a late alert is worse than a skipped chunk.
-      if (detectBusyRef.current || Date.now() < detectPausedUntilRef.current) return
-      detectBusyRef.current = true
       try {
-        const result = await detectSound(encodeWav(samples, sampleRate), getAccessToken)
+        const last = lastScoresRef.current
+        const previous = last && Date.now() - last.at < 5000 ? last.scores : undefined
+        const result = await detectSound(
+          encodeWav(samples, sampleRate),
+          getAccessToken,
+          undefined,
+          previous,
+        )
+        lastScoresRef.current = {
+          at: Date.now(),
+          scores: Object.fromEntries((result.candidates ?? []).map((c) => [c.label, c.confidence])),
+        }
         if (session === micSessionRef.current) handleDetection(result)
       } catch (error) {
         if (!(error instanceof ApiError)) {
@@ -1272,11 +1342,39 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
           setBackendStatus('error')
         }
         // 422 invalid_audio (e.g. a glitchy chunk) is ignored; the next chunk is tried normally.
+      }
+    },
+    [handleDetection],
+  )
+
+  const sendChunk = useCallback(
+    async (samples: Float32Array, sampleRate: number, session: number) => {
+      if (Date.now() < detectPausedUntilRef.current) return
+      // While a request is in flight, keep only the newest chunk and send it right after. Dropping it
+      // could lose a short sound (doorbell, knock) entirely; older waiting chunks are not worth the delay.
+      if (detectBusyRef.current) {
+        pendingChunkRef.current = { samples, sampleRate, session }
+        return
+      }
+      detectBusyRef.current = true
+      try {
+        let job: { samples: Float32Array; sampleRate: number; session: number } | null = {
+          samples,
+          sampleRate,
+          session,
+        }
+        while (job) {
+          await detectOne(job.samples, job.sampleRate, job.session)
+          job = pendingChunkRef.current
+          pendingChunkRef.current = null
+          if (job && (job.session !== micSessionRef.current || Date.now() < detectPausedUntilRef.current))
+            job = null
+        }
       } finally {
         detectBusyRef.current = false
       }
     },
-    [handleDetection],
+    [detectOne],
   )
 
   const states = useMemo(() => {
@@ -1300,7 +1398,7 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
         }
       : currentState
   const isUrgent = previewState.priority === 2
-  const isWarning = previewState.priority === 1
+  const isWarning = previewState.priority === 1 && previewState.id !== 'phrase'
 
   useEffect(() => {
     activeRef.current = activeAlert
@@ -1592,9 +1690,15 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       audioRef.current = audio
       const session = ++micSessionRef.current
       // Live detection: stream 2 s chunks to the backend. If capture fails, the waveform still works.
-      void startChunkCapture(context, source, CHUNK_SECONDS, (samples) => {
-        void sendChunk(samples, context.sampleRate, session)
-      }).catch(() => setBackendStatus('error'))
+      void startChunkCapture(
+        context,
+        source,
+        CHUNK_SECONDS,
+        (samples) => {
+          void sendChunk(samples, context.sampleRate, session)
+        },
+        CHUNK_HOP_SECONDS,
+      ).catch(() => setBackendStatus('error'))
       // Mic on: start the sound model now (on Databricks it sleeps while nobody listens). The chunks
       // that follow every 2 s keep it awake; once the mic is off it goes back to sleep by itself.
       void wakeModel(getAccessToken)
@@ -1705,13 +1809,79 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     triggerRuleRef.current = triggerRule
   }, [sustainRule, triggerRule])
 
+  // Spoken phrases: while the microphone is on and at least one phrase rule is enabled, the browser's
+  // speech recognition transcribes speech and any enabled phrase it hears triggers that rule (purple by
+  // default). Nothing is sent for transcription when there are no phrase rules or the mic is off.
+  const phraseRules = useMemo(
+    () => rules.filter((rule) => rule.kind === 'phrase' && rule.enabled && rule.label.trim()),
+    [rules],
+  )
+  const phraseRulesRef = useRef(phraseRules)
+  phraseRulesRef.current = phraseRules
+  const hasPhraseRules = phraseRules.length > 0
+  useEffect(() => {
+    const Recognition = getSpeechRecognition()
+    if (listening !== 'listening' || !hasPhraseRules || !Recognition) return
+    let stopped = false
+    let session = 0
+    let recognition: BrowserSpeechRecognition | null = null
+    const firedInResult = new Set<string>() // one trigger per phrase per spoken result
+    const lastFired = new Map<string, number>() // and not again within 3 s
+
+    const start = () => {
+      if (stopped) return
+      session += 1
+      const current = session
+      const r = new Recognition()
+      r.continuous = true
+      r.interimResults = true // react while the word is still being spoken
+      r.lang = navigator.language || 'en-US'
+      r.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const best = event.results[i][0]
+          if (!best) continue
+          const spoken = normalizeSpeech(best.transcript)
+          for (const rule of phraseRulesRef.current) {
+            const key = `${current}:${i}:${rule.id}`
+            if (firedInResult.has(key) || !phraseMatches(spoken, rule.label)) continue
+            firedInResult.add(key)
+            const now = Date.now()
+            if (now - (lastFired.get(rule.id) ?? 0) < 3000) continue
+            lastFired.set(rule.id, now)
+            triggerRuleRef.current(rule.id, { confidence: best.confidence || 1 })
+          }
+        }
+      }
+      r.onerror = (event) => {
+        // Permission refused: stop retrying. Other errors (no-speech, network) end the session and
+        // onend restarts it.
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') stopped = true
+      }
+      // Browsers end recognition after a pause or about a minute; keep it going while listening.
+      r.onend = () => {
+        if (!stopped) window.setTimeout(start, 300)
+      }
+      recognition = r
+      try {
+        r.start()
+      } catch {
+        window.setTimeout(start, 1000)
+      }
+    }
+    start()
+    return () => {
+      stopped = true
+      recognition?.abort()
+    }
+  }, [listening, hasPhraseRules])
+
   const addPhrase = () => {
     const label = phraseDraft.trim()
     if (!label) return
     const id = `phrase-${Date.now()}`
     setRules((items) => [
       ...items,
-      { id, label, kind: 'phrase', enabled: true, effects: ['warning'] },
+      { id, label, kind: 'phrase', enabled: true, effects: ['phrase'] },
     ])
     setSelectedId(id)
     setPhraseDraft('')
@@ -1824,7 +1994,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     }
   }
 
-  const isCustom = !previewState.system
+  // Custom states and the purple phrase state tint the screen with their own colour.
+  const isCustom = !previewState.system || previewState.id === 'phrase'
   const style = {
     '--accent': previewState.color,
     '--app-bg': isCustom
@@ -2013,9 +2184,11 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
                 <div className="alert-notice" role="alert">
                   <span>
                     {currentState.system
-                      ? currentState.priority === 2
-                        ? 'Urgent'
-                        : 'Warning'
+                      ? currentState.id === 'phrase'
+                        ? 'Phrase'
+                        : currentState.priority === 2
+                          ? 'Urgent'
+                          : 'Warning'
                       : currentState.name}
                   </span>
                   <strong>{activeAlert.soundNames.join(', ')} detected</strong>
@@ -2152,8 +2325,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
             <span>Detection status</span>
             <p>
               Tests on this screen are simulated. While listening, sounds marked “live detection”
-              are recognised by the Alert backend ({API_STATUS_HINT[backendStatus]}). Phrases still
-              need a speech-processing integration.
+              are recognised by the Alert backend ({API_STATUS_HINT[backendStatus]}). Phrases are
+              recognised by the browser's speech recognition (Chrome and Edge).
             </p>
           </footer>
         </main>
@@ -2392,8 +2565,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
               </button>
             </div>
             <p>
-              Defines an incoming spoken word or phrase. Recognition requires a speech-processing
-              integration.
+              Defines a spoken word or phrase. While listening, the browser's speech recognition
+              (Chrome and Edge) watches for it and shows it in purple.
             </p>
             <label>
               Word or phrase

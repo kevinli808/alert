@@ -18,7 +18,9 @@ class DetectionService:
         self.classifier = classifier
         self.predictions = predictions
 
-    def detect(self, audio_bytes: bytes, user_id: str) -> DetectionOutcome:
+    def detect(
+        self, audio_bytes: bytes, user_id: str, previous_hint: dict[str, float] | None = None
+    ) -> DetectionOutcome:
         started = time.perf_counter()
         audio = self.audio_processor.process(audio_bytes)
         preprocess_ms = (time.perf_counter() - started) * 1000
@@ -31,7 +33,7 @@ class DetectionService:
             t = time.perf_counter()
             result = self.classifier.classify(audio.waveform)
             inference_ms = (time.perf_counter() - t) * 1000
-            outcome = self.predictions.process(user_id, result)
+            outcome = self.predictions.process(user_id, result, previous_hint=previous_hint)
 
         outcome.timings_ms = {
             "preprocess": round(preprocess_ms, 1),

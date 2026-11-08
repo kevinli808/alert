@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.core.errors import PayloadTooLargeError, UnsupportedMediaTypeError
@@ -19,7 +20,7 @@ from app.schemas.detection import (
 from app.services.auth_service import AuthenticatedUser
 from app.services.container import ServiceContainer
 from app.services.databricks_service import DatabricksClassifier
-from app.services.prediction_processor import DetectionOutcome
+from app.services.prediction_processor import DetectionOutcome, sanitize_scores
 from app.services.sound_categories import SOUND_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,12 @@ async def wake_model(
 )
 async def detect_sound(
     audio: UploadFile = File(..., description="Audio chunk (WAV/FLAC/OGG; WebM/MP4 if ffmpeg is installed)"),
+    previous: str | None = Form(
+        None,
+        max_length=2000,
+        description="Optional JSON of the previous chunk's category scores, e.g. {\"doorbell\": 0.3}. "
+        "Lets two weak hits in a row count even when requests land on different server instances.",
+    ),
     user: AuthenticatedUser = Depends(get_detection_user),
     _rl: None = Depends(rate_limit("detect", detection=True)),
     services: ServiceContainer = Depends(get_services),
@@ -99,7 +106,13 @@ async def detect_sound(
         raise PayloadTooLargeError(f"Audio exceeds the {max_bytes}-byte limit")
 
     # CPU-bound decode + inference runs in a worker thread so the event loop stays responsive.
-    outcome = await run_in_threadpool(services.detection.detect, data, user.user_id)
+    previous_hint = None
+    if previous:
+        try:
+            previous_hint = sanitize_scores(json.loads(previous))
+        except ValueError:
+            previous_hint = None  # a bad hint is ignored, never an error
+    outcome = await run_in_threadpool(services.detection.detect, data, user.user_id, previous_hint)
     del data  # raw audio is never persisted or logged; detections are not stored either
 
     # Labels and scores only (never audio): enough to see why a sound did or didn't trigger.

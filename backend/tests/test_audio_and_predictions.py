@@ -124,6 +124,25 @@ def test_weak_rule_is_only_for_normal_priority_sounds():
     assert p.process("u", result(baby_crying=0.4, emergency_siren=0.4, dog_barking=0.0)).detected is False
 
 
+def test_previous_hint_from_client_when_server_has_no_memory():
+    # Serverless: the second chunk lands on a fresh instance with no memory of the first one.
+    p = PredictionProcessor(threshold=0.6, cooldown_seconds=10, category_thresholds={"doorbell": 0.4})
+    out = p.process("u", result(doorbell=0.25), previous_hint={"doorbell": 0.3})
+    assert out.detected and out.sound_type == "doorbell"
+    fresh = PredictionProcessor(threshold=0.6, cooldown_seconds=10)
+    assert fresh.process("u", result(emergency_siren=0.4), previous_hint={"emergency_siren": 0.9}).detected is False
+
+
+def test_previous_hint_is_sanitized():
+    from app.services.prediction_processor import sanitize_scores
+
+    assert sanitize_scores({"doorbell": 0.3, "made_up": 0.9, "dog_barking": 7, "phone_ringing": True,
+                            "door_knock": float("nan"), "alarm_clock": "0.5"}) == {"doorbell": 0.3}
+    assert sanitize_scores(["doorbell"]) == {} and sanitize_scores(None) == {}
+    p = PredictionProcessor(threshold=0.6, cooldown_seconds=10)
+    assert p.process("u", result(doorbell=0.25), previous_hint={"doorbell": 5.0}).detected is False
+
+
 def test_weak_rule_floor():
     clock = Clock()
     p = PredictionProcessor(threshold=0.2, cooldown_seconds=10, clock=clock)

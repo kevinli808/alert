@@ -32,6 +32,19 @@ WEAK_FRACTION = 0.5  # weak hit = at least half of the category's threshold...
 WEAK_MIN = 0.15  # ...and never below this
 CONFIRM_WINDOW_SECONDS = 5.0  # the two chunks must be consecutive (the browser sends one every 2 s)
 
+
+def sanitize_scores(raw: object) -> dict[str, float]:
+    """Keep only known categories with finite scores in [0, 1]; anything else is dropped silently."""
+    if not isinstance(raw, dict) or len(raw) > 50:
+        return {}
+    clean: dict[str, float] = {}
+    for key, value in raw.items():
+        if key in sc.CATEGORY_IDS and isinstance(value, (int, float)) and not isinstance(value, bool):
+            v = float(value)
+            if math.isfinite(v) and 0.0 <= v <= 1.0:
+                clean[key] = v
+    return clean
+
 Reason = Literal["detected", "below_threshold", "silence"]
 
 
@@ -135,8 +148,16 @@ class PredictionProcessor:
         )
 
     def process(
-        self, user_id: str, result: ClassificationResult, timestamp: datetime | None = None
+        self,
+        user_id: str,
+        result: ClassificationResult,
+        timestamp: datetime | None = None,
+        previous_hint: dict[str, float] | None = None,
     ) -> DetectionOutcome:
+        """`previous_hint`: the client's copy of its previous chunk's scores. Serverless hosting (Vercel)
+        may run consecutive requests on different instances, so this process's memory of the previous
+        chunk can be missing; the hint keeps the two-in-a-row rule working. It can only make the
+        caller's own detection more sensitive."""
         ts = timestamp or datetime.now(timezone.utc)
 
         scores: dict[str, float] = {}
@@ -158,7 +179,7 @@ class PredictionProcessor:
             model=result.model,
         )
 
-        previous = self._previous_scores(user_id, scores)
+        previous = self._previous_scores(user_id, scores) or sanitize_scores(previous_hint)
 
         def passes(cat: str, score: float) -> bool:
             if score >= self.threshold_for(cat):

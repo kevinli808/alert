@@ -75,6 +75,26 @@ def test_profile_settings_are_saved_and_scoped_to_verified_account(client, auth_
     assert db.settings == {"auth0|alice": settings}
 
 
+def test_profile_settings_accept_purple_phrase_state(client, auth_headers):
+    settings = {
+        "simple": False,
+        "rules": [
+            {"id": "phrase-help", "label": "Help", "kind": "phrase", "enabled": True,
+             "effects": ["urgent", "vibration"]},
+            {"id": "phrase-1", "label": "Chase", "kind": "phrase", "enabled": True, "effects": ["phrase"]},
+        ],
+        "customStates": [],
+        "stateOrder": ["urgent", "phrase", "warning", "default"],
+        "selectedRuleId": "phrase-1",
+        "priorityCollapsed": False,
+        "introComplete": True,
+    }
+    saved = client.post("/api/users/me/settings", headers=auth_headers(), json=settings)
+    assert saved.status_code == 200 and saved.json()["settings"] == settings
+    bad = {**settings, "stateOrder": ["urgent", "phrase", "phrase", "warning", "default"]}
+    assert client.post("/api/users/me/settings", headers=auth_headers(), json=bad).status_code == 422
+
+
 def test_profile_settings_require_login_and_reject_invalid_values(client, auth_headers, db):
     settings = {
         "simple": True,
@@ -184,6 +204,20 @@ def test_rate_limit(settings, container, auth_headers):
         assert c.get("/api/users/me", headers=h).status_code == 200
         resp = c.get("/api/users/me", headers=h)
         assert resp.status_code == 429 and int(resp.headers["retry-after"]) >= 1
+
+
+def test_detect_sound_accepts_previous_hint(client, auth_headers, classifier):
+    # Test container: threshold 0.6, so a weak hit is >= 0.3.
+    h = auth_headers()
+    files = {"audio": ("c.wav", wav_bytes(), "audio/wav")}
+    classifier.set(doorbell=0.35)
+    alone = client.post("/api/detect-sound", headers=h, files=files, data={"previous": '{"doorbell": 0.01}'})
+    assert alone.status_code == 200 and alone.json()["detected"] is False
+    hinted = client.post("/api/detect-sound", headers=auth_headers("auth0|fresh"), files=files,
+                         data={"previous": '{"doorbell": 0.4}'})
+    assert hinted.json()["detected"] is True and hinted.json()["sound_type"] == "doorbell"
+    junk = client.post("/api/detect-sound", headers=auth_headers("auth0|junk"), files=files, data={"previous": "not json"})
+    assert junk.status_code == 200 and junk.json()["detected"] is False
 
 
 def test_wake_model_requires_login_and_reports_status(client, auth_headers):

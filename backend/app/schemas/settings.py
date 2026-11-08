@@ -52,16 +52,18 @@ class ProfileSettings(StrictSettingsModel):
     @model_validator(mode="after")
     def validate_references(self) -> ProfileSettings:
         rule_ids = [rule.id for rule in self.rules]
-        state_ids = ["default", "warning", "urgent", *(state.id for state in self.custom_states)]
+        # "phrase" is the purple state for spoken phrases. Settings saved before it existed have no
+        # "phrase" in stateOrder; they stay valid and the frontend inserts it on load.
+        state_ids = ["default", "warning", "phrase", "urgent", *(state.id for state in self.custom_states)]
         if len(rule_ids) != len(set(rule_ids)):
             raise ValueError("rule ids must be unique")
         if len(state_ids) != len(set(state_ids)):
             raise ValueError("custom state ids must be unique")
         if self.selected_rule_id not in rule_ids:
             raise ValueError("selectedRuleId must identify a saved rule")
-        if (
-            len(self.state_order) != len(set(self.state_order))
-            or set(self.state_order) != set(state_ids)
+        if len(self.state_order) != len(set(self.state_order)) or set(self.state_order) not in (
+            set(state_ids),
+            set(state_ids) - {"phrase"},
         ):
             raise ValueError("stateOrder must contain each available state exactly once")
         allowed_effects = {
