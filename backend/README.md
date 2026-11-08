@@ -1,38 +1,44 @@
-# Alert: Backend
+# Alert API
 
-A FastAPI backend that classifies short audio chunks from the browser with Google's pretrained
-**YAMNet** model. It returns structured detections such as `fire_alarm` or `doorbell`, which the
-React app turns into each user's custom visual alert.
+The Python service behind [Alert](../README.md). It verifies Auth0 access tokens,
+classifies short audio uploads, and records account metadata in Databricks SQL.
+The browser renders detections as visual alerts.
 
 ```
-React ──(Auth0 access token + 2 s WAV chunk)──▶ FastAPI
-                                                 ├─ dependencies/auth.py      verify JWT (Auth0 JWKS, RS256)
-                                                 ├─ audio_processor.py        decode → mono → 16 kHz → validate
-                                                 ├─ sound_classifier.py       YAMNet (local)  ─┐ replaceable
-                                                 ├─ databricks_service.py     Model Serving  ─┘ provider
-                                                 ├─ prediction_processor.py   threshold, priority, cooldown/events
-                                                 └─ database_service.py       Databricks SQL (users table only)
+Browser ── Auth0 token + short audio chunk ──▶ FastAPI
+                                                ├─ Auth0 JWT verification
+                                                ├─ Audio decode and preprocessing
+                                                ├─ YAMNet (local) or Databricks Model Serving
+                                                └─ Databricks SQL (account metadata only)
 ```
+
+Audio and detection results are processed in memory and are not persisted.
+Only account metadata—Auth0 user ID, email, username, and login timestamps—is
+stored in the Databricks users table. Alert preferences remain in the browser.
 
 ## Contents
+
 1. [Quick start](#1-quick-start)
 2. [Auth0 setup](#2-auth0-setup)
 3. [Databricks users database](#3-databricks-users-database)
 4. [Sound classification](#4-sound-classification-yamnet)
-5. [Databricks (optional)](#5-databricks-optional)
+5. [Databricks inference](#5-databricks-inference)
 6. [API reference](#6-api-reference)
 7. [Testing](#7-testing)
 8. [Deployment](#8-deployment)
 9. [Security notes](#9-security-notes)
 10. [Known limitations](#10-known-limitations)
 
-React integration has its own guide: [docs/react-integration.md](docs/react-integration.md).
+Frontend setup is covered in the [project README](../README.md). For Auth0,
+Databricks, API, and backend operations, use this guide.
 
 ---
 
 ## 1. Quick start
 
-Requires Python 3.10 to 3.12 (TensorFlow does not support 3.13 yet). Tested with 3.11.9 on Windows.
+Requires Python 3.10–3.12 for local YAMNet inference (TensorFlow does not
+support Python 3.13). Python 3.12 is configured for Vercel; local development
+has been tested on Windows with Python 3.11.
 
 ```powershell
 cd backend
@@ -44,8 +50,8 @@ uvicorn app.main:app --reload
 ```
 
 - Swagger UI: http://localhost:8000/docs. Click **Authorize** and paste an Auth0 access token.
-- Health: http://localhost:8000/health. `model.status` goes from `loading` to `ready` in about 5 to 30 s.
-  The first run downloads YAMNet (~15 MB).
+- Health: http://localhost:8000/health. With local YAMNet, `model.status` goes from `loading` to
+  `ready` in about 5 to 30 s. The first run downloads YAMNet (~15 MB).
 - With Auth0 or the Databricks users database unconfigured, the server still starts. The affected endpoints return
   `503 service_not_configured`. In `ENVIRONMENT=production` the server refuses to start instead.
 
@@ -54,28 +60,28 @@ without it.
 
 ## 2. Auth0 setup
 
-**What I need from you:** an Auth0 tenant (free plan is fine).
+Create or use an Auth0 tenant with an API and a Single Page Application.
 
-1. **Create the API.** Go to Applications → APIs → *Create API*.
+1. **Create the API.** Go to Applications → APIs → _Create API_.
    - Name: `Alert API`
    - Identifier: `https://api.deaf-accessibility.app` (any URI). This is `AUTH0_AUDIENCE`.
    - Signing algorithm: **RS256**
-2. **Create the SPA app** for React. Go to Applications → *Create Application* → *Single Page Web Applications*.
-   - Allowed Callback URLs, Logout URLs and Web Origins: `http://localhost:5173` (plus your deployed URL).
-   - The **Domain** and **Client ID** go in the React `.env`. The domain also goes in backend `AUTH0_DOMAIN`.
-   - The SPA has **no client secret**. Never put a secret or Management API credential in React.
+2. **Create the SPA app** for the web frontend. Go to Applications → _Create Application_ → _Single Page Web Applications_.
+   - Allowed Callback URLs, Logout URLs, and Web Origins: `http://localhost:3000/` (plus your deployed URL).
+   - Set the **Domain** and **Client ID** as `NEXT_PUBLIC_AUTH0_DOMAIN` and `NEXT_PUBLIC_AUTH0_CLIENT_ID` in the frontend `.env.local`. Set the domain as `AUTH0_DOMAIN` in `backend/.env`.
+   - Set `NEXT_PUBLIC_AUTH0_AUDIENCE` in the frontend and `AUTH0_AUDIENCE` in the backend to the same API identifier.
+   - The SPA has **no client secret**. Never put a secret or Management API credential in frontend code.
 3. **Login methods.** Authentication → Database → `Username-Password-Authentication` (email/password,
    with sign-ups enabled). Authentication → Social → **Google** → enable it for the SPA app.
    For production, add your own Google OAuth client ID. The Auth0 dev keys are for testing only.
 4. **Add email/name to access tokens.** This is recommended; otherwise the backend calls `/userinfo`
-   once per user. Go to Actions → Library → *Create Action* → *Login / Post Login*:
+   once per user. Go to Actions → Library → _Create Action_ → _Login / Post Login_:
    ```js
    exports.onExecutePostLogin = async (event, api) => {
-     const ns = "https://deaf-accessibility.app";   // = AUTH0_CLAIM_NAMESPACE
-     api.accessToken.setCustomClaim(`${ns}/email`, event.user.email);
-     api.accessToken.setCustomClaim(`${ns}/name`, event.user.name || event.user.nickname);
-          api.accessToken.setCustomClaim("role", "authenticated");
-   };
+     const ns = 'https://deaf-accessibility.app' // = AUTH0_CLAIM_NAMESPACE
+     api.accessToken.setCustomClaim(`${ns}/email`, event.user.email)
+     api.accessToken.setCustomClaim(`${ns}/name`, event.user.name || event.user.nickname)
+   }
    ```
    Deploy it, then add it to the **Post Login** trigger flow.
 
@@ -87,29 +93,30 @@ Session management means the SPA SDK refreshes tokens and logout clears the Auth
 ## 3. Databricks users database
 
 The database records **users only**: one row per Auth0 account, written when the frontend calls
-`GET /api/users/me` after login. Alert settings stay in the browser, and detections are not stored.
+`GET /api/users/me` after login. Alert settings stay in browser storage per profile on each device,
+and detections are not stored.
 
-| Column | Meaning |
-|---|---|
-| `id` | Auth0 user id (the access token's `sub`) |
+| Column              | Meaning                                                        |
+| ------------------- | -------------------------------------------------------------- |
+| `id`                | Auth0 user id (the access token's `sub`)                       |
 | `email`, `username` | from the token claims (section 2, step 4) or Auth0 `/userinfo` |
-| `created_at` | first login |
-| `last_login_at` | most recent login |
+| `created_at`        | first login                                                    |
+| `last_login_at`     | most recent login                                              |
 
-**What I need from you:** a Databricks workspace with a SQL warehouse (the free edition works).
+Create or use a Databricks workspace with a SQL warehouse.
 
-1. **SQL warehouse.** SQL Warehouses → pick one (or *Create* a small serverless one) → **Connection
+1. **SQL warehouse.** SQL Warehouses → pick one (or _Create_ a small serverless one) → **Connection
    details**. Copy the **Server hostname** into `DATABRICKS_HOST` as `https://<hostname>`, and the id
    at the end of **HTTP path** (`/sql/1.0/warehouses/<id>`) into `DATABRICKS_WAREHOUSE_ID`.
-2. **Token.** Your avatar → Settings → Developer → Access tokens → *Generate new token*. Put it in
-   `DATABRICKS_TOKEN`. It stays in `backend/.env` only, never in React.
+2. **Token.** Your avatar → Settings → Developer → Access tokens → _Generate new token_. Put it in
+   `DATABRICKS_TOKEN`. It stays in `backend/.env` only, never in frontend code.
 3. **Table.** Open SQL Editor, choose the warehouse, and run [sql/databricks_users.sql](sql/databricks_users.sql).
    It creates the `workspace.alert` schema and the `users` table. The backend also creates the table on
    first use, so only the schema has to exist. For a different location set `DATABRICKS_USERS_TABLE`
    (`catalog.schema.table`).
 4. Restart the backend. `/health` shows `"database_configured": true`.
 
-**How access control works.** React never talks to Databricks. FastAPI verifies the Auth0 token and
+**How access control works.** The browser never talks to Databricks. FastAPI verifies the Auth0 token and
 writes the row keyed by that token's `sub`; the user id is never taken from the request. All values
 are sent as SQL statement parameters, and the table name is validated as an identifier at startup.
 
@@ -132,22 +139,22 @@ No audio is ever stored.
   checked against the real `yamnet_class_map.csv` (521 classes, 0 missing). The loader re-checks at
   startup and logs any missing labels.
 
-| Category | YAMNet classes | Priority |
-|---|---|---|
-| fire_alarm | Fire alarm | critical |
-| smoke_detector | Smoke detector, smoke alarm | critical |
+| Category        | YAMNet classes                                                                                                        | Priority |
+| --------------- | --------------------------------------------------------------------------------------------------------------------- | -------- |
+| fire_alarm      | Fire alarm                                                                                                            | critical |
+| smoke_detector  | Smoke detector, smoke alarm                                                                                           | critical |
 | emergency_siren | Siren, Civil defense siren, Police car (siren), Ambulance (siren), Fire engine, fire truck (siren), Emergency vehicle | critical |
-| glass_breaking | Shatter (there is **no** "glass breaking" class) | high |
-| baby_crying | Baby cry, infant cry | high |
-| car_alarm | Car alarm | high |
-| alarm | Alarm, Buzzer | high |
-| doorbell | Doorbell, Ding-dong | normal |
-| door_knock | Knock | normal |
-| phone_ringing | Telephone bell ringing, Ringtone, Telephone | normal |
-| alarm_clock | Alarm clock | normal |
-| dog_barking | Bark | normal |
+| glass_breaking  | Shatter (there is **no** "glass breaking" class)                                                                      | high     |
+| baby_crying     | Baby cry, infant cry                                                                                                  | high     |
+| car_alarm       | Car alarm                                                                                                             | high     |
+| alarm           | Alarm, Buzzer                                                                                                         | high     |
+| doorbell        | Doorbell, Ding-dong                                                                                                   | normal   |
+| door_knock      | Knock                                                                                                                 | normal   |
+| phone_ringing   | Telephone bell ringing, Ringtone, Telephone                                                                           | normal   |
+| alarm_clock     | Alarm clock                                                                                                           | normal   |
+| dog_barking     | Bark                                                                                                                  | normal   |
 
-- **Decision.** A category passes if its score is at least the threshold (`CONFIDENCE_THRESHOLD=0.75`
+- **Decision.** A category passes if its score is at least the threshold (`CONFIDENCE_THRESHOLD=0.6`
   by default, with per-category overrides). If several pass, the most urgent priority wins.
   Otherwise the response is `detected: false, sound_type: "unknown"`.
 - **Cooldown and event grouping.** Repeated detections of the same sound for the same user, each
@@ -157,13 +164,14 @@ No audio is ever stored.
   `502 inference_failed`). It never returns a made-up detection.
 
 **Observed on real YAMNet (synthetic signals, not real recordings):**
+
 - A synthetic 3.1 kHz T3 smoke-alarm beep scored `alarm` (Buzzer 0.82) with `smoke_detector` at
   0.67. Fire alarm, smoke detector and generic alarm overlap, so treat all three as urgent in the UI.
-- A pure sine "siren" sweep scored as *Synthesizer*, not *Siren*. Synthetic tests do not show real
+- A pure sine "siren" sweep scored as _Synthesizer_, not _Siren_. Synthetic tests do not show real
   accuracy.
 - Latency for a warm 2 s chunk was **~11–16 ms** (preprocess + inference, CPU).
 
-**Calibrate before trusting 0.75.** Collect real clips (your own recordings, or Freesound / ESC-50
+**Calibrate before trusting the default threshold of 0.6.** Collect real clips (your own recordings, or Freesound / ESC-50
 / AudioSet clips with compatible licences) in `eval_data/<category>/*.wav`, plus
 `eval_data/background/` for TV, speech, kitchen noise and similar. Then run:
 
@@ -174,16 +182,16 @@ python -m scripts.evaluate_model eval_data            # add --mlflow to log to D
 Pick thresholds that favour **recall** for critical sounds, since a missed fire alarm is worse
 than a false flash. Set them with `CATEGORY_THRESHOLDS`.
 
-## 5. Databricks (optional)
+## 5. Databricks inference
 
-Local YAMNet is the default and is enough for the MVP. Databricks adds experiment tracking and
-optional hosted inference. **No endpoint is assumed to exist.** Until you configure one, the
-provider reports `not_configured` and nothing is sent.
+Local YAMNet is the default for local development. Databricks Model Serving provides hosted
+inference and is required on Vercel because the Vercel backend dependency set excludes TensorFlow.
+No endpoint is included or created automatically.
 
 1. Experiments: run `scripts/evaluate_model.py --mlflow` with `MLFLOW_TRACKING_URI=databricks`
    (plus `DATABRICKS_HOST` and `DATABRICKS_TOKEN`) to track threshold experiments.
 2. Package the model: in a Databricks notebook, run
-   [databricks/yamnet_pyfunc.py](databricks/yamnet_pyfunc.py). It logs YAMNet plus the *same*
+   [databricks/yamnet_pyfunc.py](databricks/yamnet_pyfunc.py). It logs YAMNet plus the _same_
    `sound_categories.py` mapping as an MLflow pyfunc and registers it.
 3. Serve it: go to **Serving → Create serving endpoint**, pick the registered model, choose CPU
    Small, and turn on scale-to-zero.
@@ -196,27 +204,30 @@ provider reports `not_configured` and nothing is sent.
    DATABRICKS_FALLBACK_TO_LOCAL=true     # use local YAMNet if the endpoint errors or times out
    ```
 5. Compare: `inference.provider` and `inference.inference_ms` in each response show which path ran
-   and how long it took. Local inference took ~15 ms. A remote call adds a network round trip of
-   roughly 100–300 ms, plus cold starts with scale-to-zero. For continuous monitoring, **local
-   inference is the better default.** Use Databricks for a fine-tuned model you can't run locally.
+   and how long it took. Remote inference adds a network round trip and may have cold starts when
+   the endpoint scales to zero.
 
 The wire format (base64 int16 PCM, about 85 KB per 2 s) is documented at the top of
 [app/services/databricks_service.py](app/services/databricks_service.py).
 
 ## 6. API reference
 
+In production, API routes require authorization except for `/api/sound-types`. Token-less detection
+is allowed only in local development when Auth0 is not configured.
+
 Every `/api/*` route except `/api/sound-types` needs `Authorization: Bearer <Auth0 access token>`.
 Errors always use the shape `{"error": {"code", "message", "details?"}}`. Full interactive docs are
 at `/docs`.
 
-| Method | Path | Purpose | Notes |
-|---|---|---|---|
-| GET | `/health` | Model, auth and DB status | public |
-| GET | `/api/sound-types` | Detectable categories and thresholds | public |
-| GET | `/api/users/me` | Record the logged-in user (row created on first call, `last_login_at` updated after) | called by the frontend after login |
-| POST | `/api/detect-sound` | Classify one chunk | multipart field `audio`; 0.5–10 s; ≤2 MB |
+| Method | Path                | Purpose                                                                              | Notes                                    |
+| ------ | ------------------- | ------------------------------------------------------------------------------------ | ---------------------------------------- |
+| GET    | `/health`           | Model, auth and DB status                                                            | public                                   |
+| GET    | `/api/sound-types`  | Detectable categories and thresholds                                                 | public                                   |
+| GET    | `/api/users/me`     | Record the logged-in user (row created on first call, `last_login_at` updated after) | called by the frontend after login       |
+| POST   | `/api/detect-sound` | Classify one chunk                                                                   | multipart field `audio`; 0.5–10 s; ≤2 MB |
 
 Status codes:
+
 - `401` missing or invalid token
 - `413` file too large
 - `415` not audio
@@ -228,7 +239,7 @@ Status codes:
 ### Examples
 
 ```bash
-TOKEN="<paste access token>"   # React: await getAccessTokenSilently(); or Auth0 → APIs → Test tab
+TOKEN="<paste access token>"   # Frontend: await getAccessTokenSilently(); or Auth0 → APIs → Test tab
 API=http://localhost:8000
 
 curl $API/api/users/me -H "Authorization: Bearer $TOKEN"
@@ -239,11 +250,12 @@ curl -X POST $API/api/detect-sound -H "Authorization: Bearer $TOKEN" -F "audio=@
 ## 7. Testing
 
 ```bash
-pytest                              # 65 tests, no network or credentials needed (~6 s)
+pytest                              # no network or credentials needed
 RUN_MODEL_TESTS=1 pytest -s tests/test_yamnet_integration.py   # real YAMNet + latency (PowerShell: $env:RUN_MODEL_TESTS=1)
 ```
 
 The tests cover:
+
 - JWT validation: expiry, audience, issuer, unknown key, forged signature, HS256 algorithm confusion
 - per-user data isolation, and rejection of a `user_id` in the request body
 - token-less detection only in local development without Auth0, never touching the database
@@ -255,21 +267,23 @@ The tests cover:
 
 Test doubles live only in `tests/`.
 
-**End-to-end with real services** (Phase 6). Once your `.env` is filled in:
-1. log in through React
+**End-to-end with real services.** Once your `.env` is configured:
+
+1. log in through the web app
 2. confirm a row appears: `SELECT * FROM workspace.alert.users ORDER BY last_login_at DESC`
 3. reload the page and confirm `last_login_at` moves forward on the same row
 4. sign in as a second user and confirm a second row appears
 
 ## 8. Deployment
 
-Deploy only if the demo needs a public URL. Running locally with React on `localhost` is enough
-for judging. If you do deploy:
+For a single-container deployment, build and run the Docker image below. For the configured
+two-service Vercel deployment, see [Vercel](#vercel).
 
 - **Host:** any container host that gives at least **2 GB RAM** works, e.g. Render, Railway,
   Fly.io or Google Cloud Run. TensorFlow and YAMNet use about 700 MB to 1 GB.
-- **Build:** `docker build -t alert-api .` The YAMNet weights are baked into the image, so
-  starts are fast.
+- **Build and run:** From `backend/`, run `docker build -t alert-api .` and then
+  `docker run --env-file .env -p 8000:8000 alert-api`. The YAMNet weights are baked into the
+  image, so starts do not need to download the model.
 - **Environment variables:** set the same variables as `.env`, plus `ENVIRONMENT=production` and
   `CORS_ORIGINS=https://your-frontend.app`. Use the host's secret manager, never a committed file.
 - **One worker:** run a single worker or instance. The rate limiter and event cooldown are in
@@ -284,11 +298,10 @@ The Vercel backend service installs `requirements.txt`, which deliberately exclu
 TensorFlow is too large for a standard Vercel Python function bundle. The Vercel deployment
 therefore defaults to Databricks inference and disables local-model fallback. Create a working
 Databricks Model Serving endpoint and configure `ENVIRONMENT=production`, `AUTH0_DOMAIN`,
-`AUTH0_AUDIENCE`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `INFERENCE_PROVIDER=databricks`,
-`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and `DATABRICKS_ENDPOINT_NAME` on the backend service.
+`AUTH0_AUDIENCE`, `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_WAREHOUSE_ID`,
+`INFERENCE_PROVIDER=databricks`, and `DATABRICKS_ENDPOINT_NAME` on the backend service.
 Missing required production settings cause startup validation to fail rather than running with
-insecure or nonfunctional defaults. Keep `DATABRICKS_FALLBACK_TO_LOCAL=false` and
-`PRELOAD_MODEL=false`.
+insecure or nonfunctional defaults. Keep `DATABRICKS_FALLBACK_TO_LOCAL=false`.
 
 Local development installs `requirements-dev.txt`, which also installs
 `requirements-local.txt` for local YAMNet inference. Do not add TensorFlow back to

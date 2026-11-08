@@ -73,6 +73,8 @@ type StoredSettings = {
   rules: SoundRule[]
   customStates: VisualState[]
   stateOrder: string[]
+  selectedRuleId: string
+  priorityCollapsed: boolean
   introComplete: boolean
 }
 
@@ -214,17 +216,31 @@ const API_STATUS_HINT: Record<BackendStatus, string> = {
 }
 
 const DEFAULT_SETTINGS: StoredSettings = {
-  simple: false,
+  simple: true,
   rules: DEFAULT_RULES,
   customStates: [],
   stateOrder: SYSTEM_STATE_ORDER,
+  selectedRuleId: DEFAULT_RULES[0].id,
+  priorityCollapsed: false,
   introComplete: false,
 }
 
-function loadSettings(): StoredSettings {
+function loadSettings(storageKey: string): StoredSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS
   try {
-    return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'))
+    let serialized = localStorage.getItem(storageKey)
+    if (!serialized) {
+      const legacySettings = localStorage.getItem(STORAGE_KEY)
+      const guestSettings = localStorage.getItem(`${STORAGE_KEY}:guest`)
+      serialized = legacySettings || guestSettings
+      if (serialized) {
+        localStorage.setItem(storageKey, serialized)
+        if (legacySettings) localStorage.removeItem(STORAGE_KEY)
+        if (guestSettings && storageKey !== `${STORAGE_KEY}:guest`)
+          localStorage.removeItem(`${STORAGE_KEY}:guest`)
+      }
+    }
+    return normalizeSettings(JSON.parse(serialized || '{}'))
   } catch {
     return DEFAULT_SETTINGS
   }
@@ -270,10 +286,13 @@ function normalizeSettings(saved: Partial<StoredSettings>): StoredSettings {
       }
     })
     return {
-      simple: saved.simple ?? false,
+      simple: saved.simple ?? DEFAULT_SETTINGS.simple,
       rules,
       customStates,
       stateOrder,
+      selectedRuleId:
+        typeof saved.selectedRuleId === 'string' ? saved.selectedRuleId : DEFAULT_RULES[0].id,
+      priorityCollapsed: saved.priorityCollapsed ?? false,
       introComplete: saved.introComplete ?? false,
     }
   } catch {
@@ -369,10 +388,12 @@ function Toggle({
   checked,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean
   onChange: () => void
   label: string
+  disabled?: boolean
 }) {
   return (
     <button
@@ -380,6 +401,7 @@ function Toggle({
       role="switch"
       aria-checked={checked}
       aria-label={label}
+      disabled={disabled}
       onClick={onChange}
       className={`toggle ${checked ? 'toggle-on' : ''}`}
     >
@@ -956,21 +978,22 @@ function SimpleEditor(props: EditorProps) {
               </label>
             )
           })}
-          <legend className="secondary-legend">Future effects</legend>
-          {FUTURE_EFFECTS.map((effect) => {
-            const checked = selected?.effects.includes(effect.id) ?? false
-            return (
-              <label key={effect.id} className="future-effect-option">
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => selected && props.changeEffect(selected.id, effect.id, false)}
-                />
-                <span>{effect.name}</span>
-                <small>Future</small>
-              </label>
-            )
-          })}
+          <details className="future-effects">
+            <summary>More integrations (not available yet)</summary>
+            {FUTURE_EFFECTS.map((effect) => {
+              const checked = selected?.effects.includes(effect.id) ?? false
+              return (
+                <label key={effect.id} className="future-effect-option">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => selected && props.changeEffect(selected.id, effect.id, false)}
+                  />
+                  <span>{effect.name}</span>
+                </label>
+              )
+            })}
+          </details>
         </fieldset>
         {selected?.effects.includes('tts') && (
           <label className="tts-field">
@@ -1156,18 +1179,21 @@ type RealAuth = {
 }
 
 function AlertApp({ auth }: { auth: RealAuth | null }) {
-  const initial = useMemo(loadSettings, [])
   const [view, setView] = useState<View>('home')
-  const [simple, setSimple] = useState(initial.simple)
-  const [rules, setRules] = useState<SoundRule[]>(initial.rules)
-  const [customStates, setCustomStates] = useState<VisualState[]>(initial.customStates)
-  const [stateOrder, setStateOrder] = useState(initial.stateOrder)
-  const [introComplete, setIntroComplete] = useState(initial.introComplete)
+  const [simple, setSimple] = useState(DEFAULT_SETTINGS.simple)
+  const [rules, setRules] = useState<SoundRule[]>(DEFAULT_SETTINGS.rules)
+  const [customStates, setCustomStates] = useState<VisualState[]>(DEFAULT_SETTINGS.customStates)
+  const [stateOrder, setStateOrder] = useState(DEFAULT_SETTINGS.stateOrder)
+  const [introComplete, setIntroComplete] = useState(DEFAULT_SETTINGS.introComplete)
   const [dialog, setDialog] = useState<DialogName>(null)
   const [introHelp, setIntroHelp] = useState(false)
   const [localAccount, setLocalAccount] = useState<{ name: string; email: string } | null>(null)
   const account = auth ? auth.user : localAccount
   const accountKey = auth ? (auth.user?.id ?? null) : (localAccount?.email ?? null)
+  const settingsStorageKey = `${STORAGE_KEY}:${accountKey ? encodeURIComponent(accountKey) : 'guest'}`
+  const [accountReady, setAccountReady] = useState(false)
+  const [loadedSettingsKey, setLoadedSettingsKey] = useState<string | null>(null)
+  const settingsReady = accountReady && loadedSettingsKey === settingsStorageKey
   const [accountMode, setAccountMode] = useState<'login' | 'create'>('login')
   const [listening, setListening] = useState<ListeningState>('paused')
   const [audioLevel, setAudioLevel] = useState(0)
@@ -1175,9 +1201,9 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const [clock, setClock] = useState(() => Date.now())
   const [activeAlert, setActiveAlert] = useState<ActiveAlert | null>(null)
   const [pendingAlerts, setPendingAlerts] = useState<AlertRequest[]>([])
-  const [selectedId, setSelectedId] = useState(rules[0]?.id ?? '')
-  const [priorityCollapsed, setPriorityCollapsed] = useState(false)
-  const [saveStatus, setSaveStatus] = useState<'saving' | 'saved' | 'error'>('saved')
+  const [selectedId, setSelectedId] = useState(DEFAULT_SETTINGS.selectedRuleId)
+  const [priorityCollapsed, setPriorityCollapsed] = useState(DEFAULT_SETTINGS.priorityCollapsed)
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'error'>('saved')
   const [phraseDraft, setPhraseDraft] = useState('')
   const [showPhraseForm, setShowPhraseForm] = useState(false)
   const [editingStateId, setEditingStateId] = useState<string | null>(null)
@@ -1308,7 +1334,10 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     pendingRef.current = pendingAlerts
   }, [pendingAlerts])
   useEffect(() => {
-    if (auth) return // real login: Auth0 owns the account
+    if (auth) {
+      if (!auth.loading) setAccountReady(true)
+      return
+    }
     try {
       const saved = JSON.parse(localStorage.getItem(ACCOUNT_KEY) || 'null') as {
         name: string
@@ -1316,13 +1345,43 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       } | null
       setLocalAccount(saved)
     } catch {
-      /* local account preview remains signed out */
+      setLocalAccount(null)
+    } finally {
+      setAccountReady(true)
     }
-  }, [])
+  }, [auth])
+
+  useEffect(() => {
+    if (!accountReady) {
+      setLoadedSettingsKey(null)
+      return
+    }
+    const restored = loadSettings(settingsStorageKey)
+    setSimple(restored.simple)
+    setRules(restored.rules)
+    setCustomStates(restored.customStates)
+    setStateOrder(restored.stateOrder)
+    setSelectedId(
+      restored.rules.some((rule) => rule.id === restored.selectedRuleId)
+        ? restored.selectedRuleId
+        : (restored.rules[0]?.id ?? ''),
+    )
+    setPriorityCollapsed(restored.priorityCollapsed)
+    setIntroComplete(restored.introComplete)
+    setLoadedSettingsKey(settingsStorageKey)
+  }, [accountReady, settingsStorageKey])
 
   const settings = useMemo<StoredSettings>(
-    () => ({ simple, rules, customStates, stateOrder, introComplete }),
-    [customStates, introComplete, rules, simple, stateOrder],
+    () => ({
+      simple,
+      rules,
+      customStates,
+      stateOrder,
+      selectedRuleId: selectedId,
+      priorityCollapsed,
+      introComplete,
+    }),
+    [customStates, introComplete, priorityCollapsed, rules, selectedId, simple, stateOrder],
   )
   useEffect(() => {
     // On a real Auth0 login, record the user in the backend's users table (Databricks).
@@ -1340,18 +1399,14 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   }, [auth, accountKey])
 
   useEffect(() => {
-    // Settings are saved in this browser only; the server stores users, nothing else.
-    setSaveStatus('saving')
-    const timeout = window.setTimeout(() => {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
-        setSaveStatus('saved')
-      } catch {
-        setSaveStatus('error')
-      }
-    }, 600)
-    return () => window.clearTimeout(timeout)
-  }, [settings])
+    if (!accountReady || loadedSettingsKey !== settingsStorageKey) return
+    try {
+      localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
+      setSaveStatus('saved')
+    } catch {
+      setSaveStatus('error')
+    }
+  }, [accountReady, loadedSettingsKey, settings, settingsStorageKey])
 
   const stateDuration = useCallback(
     (stateId: string) => {
@@ -1473,6 +1528,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     setRules(DEFAULT_RULES)
     setCustomStates([])
     setStateOrder(SYSTEM_STATE_ORDER)
+    setSimple(DEFAULT_SETTINGS.simple)
+    setPriorityCollapsed(DEFAULT_SETTINGS.priorityCollapsed)
     setSelectedId(DEFAULT_RULES[0].id)
   }
 
@@ -1597,7 +1654,9 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       setDetections((items) =>
         items.some((item) => item.id === id)
           ? items.map((item) =>
-              item.id === id ? { ...item, expiresAt: now + 6500, confidence: live.confidence } : item,
+              item.id === id
+                ? { ...item, expiresAt: now + 6500, confidence: live.confidence }
+                : item,
             )
           : items,
       )
@@ -1830,10 +1889,11 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
             {simple && <span>Help</span>}
           </button>
           <div className="simply-control">
-            <span>Simply</span>
+            <span>Simple UI</span>
             <Toggle
               checked={simple}
-              label="Toggle simplified mode"
+              label="Toggle simple settings view"
+              disabled={!settingsReady}
               onChange={() => {
                 setSimple((value) => !value)
               }}
@@ -1843,6 +1903,7 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
             className={`nav-button ${view === 'configure' ? 'active' : ''}`}
             type="button"
             aria-label="Menu"
+            disabled={!settingsReady}
             onClick={() => setView('configure')}
           >
             <Icon name="menu" />
@@ -2011,12 +2072,16 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
               <p>Connect recognized inputs to one or more responses.</p>
             </div>
             <div className="save-actions">
-              <span className={saveStatus === 'error' ? 'save-error' : ''}>
-                {saveStatus === 'saving'
-                  ? 'Saving…'
+              <span
+                className={saveStatus === 'error' ? 'save-error' : ''}
+                role="status"
+                aria-live="polite"
+              >
+                {!settingsReady
+                  ? 'Loading settings…'
                   : saveStatus === 'error'
-                    ? 'Unable to save'
-                    : 'Saved'}
+                    ? 'Unable to save on this device'
+                    : 'Saved on this device'}
               </span>
               <button type="button" onClick={resetSettings}>
                 Reset defaults

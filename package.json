@@ -6,7 +6,8 @@
   "packageManager": "pnpm@10.28.0",
   "scripts": {
     "dev": "next dev --port ${PORT:-3000} --hostname 0.0.0.0",
-    "build": "payload migrate && payload build",
+    "build": "payload build",
+    "migrate": "payload migrate",
     "start": "next start",
     "format": "oxfmt",
     "generate:importmap": "payload generate:importmap",

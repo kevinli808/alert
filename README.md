@@ -1,57 +1,212 @@
 # Alert
 
-## Local development
+**See important sounds.**
 
-Install dependencies with `pnpm install`, then run the frontend with `pnpm dev`.
-The FastAPI backend lives in `backend/`; its setup and local inference
-dependencies are documented in [backend/README.md](backend/README.md).
-Set `NEXT_PUBLIC_API_URL=http://localhost:8000` in `.env.local` for local
-frontend development.
+Alert listens for environmental sounds and turns detections—such as alarms,
+sirens, doorbells, and a baby crying—into visual alerts. Sign in with Auth0 to
+use authenticated detection and account features.
 
-## Vercel services
+> **Safety notice:** Alert is an assistive tool, not a certified alarm or
+> life-safety system. It may miss sounds or report false detections. Do not use
+> it as a replacement for approved smoke alarms, strobe alarms, or other
+> emergency equipment.
 
-The root `vercel.json` deploys the Next.js app and FastAPI backend as separate
-services. The app forwards its API requests through the shared deployment
-domain; the backend serves the sound-detection API paths and `/health`.
+## How it works
 
-The Payload CMS uses standalone infrastructure, not Figma-managed services.
-Provision PostgreSQL (use a pooled connection URL) and a Vercel Blob store.
-Configure these variables on the **app** service in Vercel:
+- The browser captures short audio chunks only while sound monitoring is active.
+- The FastAPI service processes each chunk and returns a sound category,
+  confidence, and detection status.
+- The frontend turns detections into the user's configured visual alerts.
+- Auth0 provides sign-in. The backend verifies access tokens and records
+  account metadata in a Databricks SQL table.
 
-- `DATABASE_URL` — PostgreSQL connection string for Payload.
-- `PAYLOAD_SECRET` — long, random Payload encryption/auth secret.
-- `BLOB_READ_WRITE_TOKEN` — token supplied by Vercel Blob.
-- `NEXT_PUBLIC_SITE_URL` — optional canonical public site URL.
+Audio recordings and sound detections are not stored by the backend. Alert
+preferences are saved in browser storage per profile on each device; they are
+not synced between devices.
 
-The initial Payload schema migration is included in `src/migrations/`. The Vercel
-build runs pending migrations before building the app, so `DATABASE_URL` and
-`PAYLOAD_SECRET` must be available to the build environment. Keep future
-migration files in source control; do not run `migrate:create` as part of each
-deployment. Use a separate database for Vercel Preview deployments so preview
-migrations cannot alter production data.
+## Project layout
 
-Configure the frontend's public Auth0 identifiers (`NEXT_PUBLIC_AUTH0_DOMAIN`,
-`NEXT_PUBLIC_AUTH0_CLIENT_ID`, and `NEXT_PUBLIC_AUTH0_AUDIENCE`) on the app
-service. Set the audience to the exact Auth0 API identifier (without a trailing
-slash); the frontend also removes accidental trailing slashes.
+| Path                  | Purpose                                            |
+| --------------------- | -------------------------------------------------- |
+| `src/app/(frontend)/` | Next.js app and browser UI                         |
+| `src/app/(payload)/`  | Payload CMS admin and API routes                   |
+| `src/collections/`    | Payload collections                                |
+| `src/migrations/`     | Versioned PostgreSQL schema migrations             |
+| `backend/`            | FastAPI API, audio processing, auth, and inference |
+| `vercel.json`         | Vercel app/backend services and public API routing |
 
-The **backend** service intentionally excludes TensorFlow to keep its Vercel
-function bundle within the 500 MB Python function limit
-([Vercel documentation](https://vercel.com/docs/functions/limitations#bundle-size-limits)).
-It uses remote Databricks inference.
-Create and configure the Databricks model-serving endpoint, then set
-`ENVIRONMENT=production`, `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`, `SUPABASE_URL`,
-`SUPABASE_SERVICE_KEY`, `INFERENCE_PROVIDER=databricks`, `DATABRICKS_HOST`,
-`DATABRICKS_TOKEN`, and `DATABRICKS_ENDPOINT_NAME` on the backend service.
-Keep `DATABRICKS_FALLBACK_TO_LOCAL=false`; local TensorFlow inference cannot run
-in the Vercel function bundle.
-Never commit secret values. Local YAMNet inference remains available through
-`backend/requirements-local.txt`.
+The Payload CMS is separate from the app's account store. Payload uses
+PostgreSQL and Vercel Blob for CMS media; app user records use Databricks SQL.
+The existing Figma-hosted CMS content and media have not been migrated.
 
-The existing Figma-hosted Payload database and media are not migrated by this
-configuration change. Export and import that content separately before
-switching users to the new CMS.
+## Run locally
 
-Create the first CMS administrator through Payload's first-user setup after the
-deployment has been configured. Add the deployed URL to the Auth0 SPA callback,
-logout, and web-origin allowlists.
+### Prerequisites
+
+- Node.js 24 and pnpm 10
+- Python 3.12
+- Auth0 credentials for login and authenticated API requests
+- Databricks SQL warehouse credentials to record users
+- Optional for the CMS: PostgreSQL and a Vercel Blob token
+
+### 1. Install frontend dependencies
+
+From the repository root:
+
+```powershell
+corepack enable
+pnpm install
+Copy-Item .env.example .env.local
+```
+
+Set the public Auth0 values in `.env.local`:
+
+```dotenv
+NEXT_PUBLIC_AUTH0_DOMAIN=your-tenant.us.auth0.com
+NEXT_PUBLIC_AUTH0_CLIENT_ID=your-auth0-application-client-id
+NEXT_PUBLIC_AUTH0_AUDIENCE=https://your-auth0-api-identifier
+```
+
+The audience must exactly match the identifier of an API configured in the
+Auth0 tenant. Add `http://localhost:3000/` to the SPA's Allowed Callback URLs,
+Allowed Logout URLs, and Allowed Web Origins.
+
+### 2. Configure and run the backend
+
+In a second terminal:
+
+```powershell
+Set-Location backend
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+```
+
+Fill in the Auth0 and Databricks settings in `backend/.env`. The same Auth0 API
+audience must be used by the frontend and backend. `requirements-dev.txt`
+includes the optional TensorFlow dependencies for local YAMNet inference.
+
+Start the API:
+
+```powershell
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+For macOS/Linux, activate the virtual environment with
+`source .venv/bin/activate`; use `cp` instead of `Copy-Item`.
+
+### 3. Run the frontend
+
+From the repository root in another terminal:
+
+```powershell
+pnpm dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). The API health check and
+interactive documentation are available at [http://localhost:8000/health](http://localhost:8000/health)
+and [http://localhost:8000/docs](http://localhost:8000/docs).
+
+If Auth0 is not configured in the frontend, the app uses its local preview
+account. Authenticated API features require valid Auth0 configuration.
+
+For backend setup, Auth0 and Databricks configuration, API details, and
+troubleshooting, see the [backend guide](backend/README.md).
+
+## Deploy to Vercel
+
+The repository configures two services:
+
+- **`app`** — Next.js frontend and Payload CMS.
+- **`backend`** — FastAPI sound detection and user account API.
+
+The backend is public only through the API paths and health check listed in
+[vercel.json](vercel.json); all other requests go to the app. No service binding
+is used.
+
+### App service environment
+
+Configure these variables for the Vercel `app` service:
+
+| Variable                      | Purpose                                   |
+| ----------------------------- | ----------------------------------------- |
+| `NEXT_PUBLIC_AUTH0_DOMAIN`    | Public Auth0 tenant domain                |
+| `NEXT_PUBLIC_AUTH0_CLIENT_ID` | Public Auth0 SPA client ID                |
+| `NEXT_PUBLIC_AUTH0_AUDIENCE`  | Auth0 API identifier used by the backend  |
+| `DATABASE_URL`                | PostgreSQL connection URL for Payload     |
+| `PAYLOAD_SECRET`              | Private Payload signing/encryption secret |
+| `BLOB_READ_WRITE_TOKEN`       | Vercel Blob storage token                 |
+| `NEXT_PUBLIC_SITE_URL`        | Optional canonical site URL               |
+
+Use the exact deployed URL in the Auth0 SPA callback, logout, and web-origin
+allowlists. Keep secrets such as `PAYLOAD_SECRET` private; only the Auth0
+`NEXT_PUBLIC_*` identifiers are intended for the browser.
+
+### Backend service environment
+
+Configure the backend variables in `backend/.env.example` in the Vercel
+`backend` service settings. Production requires Auth0, Databricks SQL, and
+Databricks Model Serving:
+
+- `ENVIRONMENT=production`
+- `AUTH0_DOMAIN`, `AUTH0_AUDIENCE`
+- `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_WAREHOUSE_ID`
+- `INFERENCE_PROVIDER=databricks`
+- `DATABRICKS_ENDPOINT_NAME`
+- `DATABRICKS_FALLBACK_TO_LOCAL=false`
+
+The Vercel backend dependency set intentionally excludes TensorFlow to fit the
+Python function bundle limit. Consequently, inference on Vercel requires a
+configured Databricks Model Serving endpoint. See the [backend deployment
+guide](backend/README.md#vercel) for all production settings.
+
+### Payload database migrations
+
+The initial PostgreSQL migration is committed in `src/migrations/`. Configure
+`DATABASE_URL` and `PAYLOAD_SECRET`, then apply migrations to the target database
+before deploying:
+
+```powershell
+pnpm migrate
+```
+
+For future schema changes, generate and commit a migration with
+`pnpm payload migrate:create <name>`, then run `pnpm migrate` against the
+appropriate database before deploying. Use a separate database for Vercel
+Preview deployments to avoid applying preview migrations to production.
+
+The application build (`pnpm build`) does not connect to the database. Payload
+CMS runtime features still require the app service's database, secret, and Blob
+environment variables.
+
+## Verification
+
+Run backend tests from the repository root:
+
+```powershell
+backend\.venv\Scripts\python.exe -m pytest backend\tests
+```
+
+Build and type-check the frontend:
+
+```powershell
+pnpm build
+pnpm exec next typegen
+pnpm exec tsc --noEmit
+```
+
+## Privacy and limitations
+
+- Microphone access is requested by the browser and is used for live detection.
+- The backend does not persist submitted audio or detection history.
+- Databricks stores account metadata used to record logins.
+- Sound classification can be inaccurate and should not be relied on for
+  emergency response.
+- Local inference and Vercel inference use different providers: local YAMNet
+  versus Databricks Model Serving.
+
+## License
+
+No license is currently specified. All rights reserved unless the repository
+owner publishes a license.

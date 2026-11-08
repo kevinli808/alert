@@ -1135,6 +1135,19 @@
 .simple-effects .secondary-legend {
   margin-top: 17px;
 }
+.future-effects {
+  margin-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.future-effects summary {
+  padding: 12px 0 4px;
+  color: var(--text-3);
+  font-size: 11px;
+  cursor: pointer;
+}
+.future-effects[open] summary {
+  margin-bottom: 4px;
+}
 .simple-effects fieldset label {
   min-height: 38px;
   border-bottom: 1px solid var(--border);
