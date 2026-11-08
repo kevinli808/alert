@@ -24,6 +24,12 @@
       }
     },
     {
+      "source": "/api/wake-model",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
       "source": "/api/users/me",
       "destination": {
         "service": "backend"

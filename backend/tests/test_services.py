@@ -153,6 +153,9 @@ def test_databricks_request_and_response_contract():
 @pytest.mark.parametrize("response, exc", [
     (httpx.Response(401), InferenceError),
     (httpx.Response(404), ModelUnavailableError),
+    (httpx.Response(503), ModelUnavailableError),
+    (httpx.Response(504), ModelUnavailableError),
+    (httpx.Response(500), InferenceError),
     (httpx.Response(200, json={"unexpected": True}), InferenceError),
 ])
 def test_databricks_errors(response, exc):
@@ -160,12 +163,30 @@ def test_databricks_errors(response, exc):
         _databricks_with(lambda req: response).classify(np.zeros(16_000, dtype=np.float32))
 
 
-def test_databricks_timeout():
+def test_databricks_timeout_means_waking_up_not_failure():
+    # A scaled-to-zero endpoint holds the first requests for ~1 min while a replica starts.
     def slow(req):
         raise httpx.ReadTimeout("timeout")
 
-    with pytest.raises(InferenceError, match="timed out"):
+    with pytest.raises(ModelUnavailableError, match="waking up"):
         _databricks_with(slow).classify(np.zeros(16_000, dtype=np.float32))
+
+
+def test_databricks_wake():
+    seen = []
+
+    def ok(req):
+        seen.append(json.loads(req.content))
+        return httpx.Response(200, json={"predictions": [{"category_scores": {}, "top_labels": []}]})
+
+    def slow(req):
+        raise httpx.ReadTimeout("timeout")
+
+    assert _databricks_with(ok).wake() == "ready"
+    assert seen[0]["dataframe_records"][0]["sample_rate"] == 16000  # same contract as classify
+    assert _databricks_with(slow).wake() == "waking"
+    assert _databricks_with(lambda req: httpx.Response(503)).wake() == "waking"
+    assert DatabricksClassifier("", "", "").wake() == "not_configured"
 
 
 def test_unconfigured_databricks_and_fallback():

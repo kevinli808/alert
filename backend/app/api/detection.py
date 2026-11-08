@@ -18,6 +18,7 @@ from app.schemas.detection import (
 )
 from app.services.auth_service import AuthenticatedUser
 from app.services.container import ServiceContainer
+from app.services.databricks_service import DatabricksClassifier
 from app.services.prediction_processor import DetectionOutcome
 from app.services.sound_categories import SOUND_CATEGORIES
 
@@ -46,6 +47,29 @@ def list_sound_types(services: ServiceContainer = Depends(get_services)) -> Soun
             for c in SOUND_CATEGORIES
         ]
     )
+
+
+@router.post(
+    "/wake-model",
+    summary="Start the sound model now (call when the microphone turns on)",
+    description=(
+        "With Databricks Model Serving and scale-to-zero, the endpoint sleeps while nobody is listening. "
+        "The frontend calls this when the microphone turns on so the model starts before the first "
+        "audio chunk arrives. Returns `ready`, `waking` (try detection anyway; chunks return "
+        "`model_unavailable` until it is up) or the local model's status."
+    ),
+    responses=error_responses(401, 429),
+)
+async def wake_model(
+    user: AuthenticatedUser = Depends(get_detection_user),
+    _rl: None = Depends(rate_limit("default", detection=True)),
+    services: ServiceContainer = Depends(get_services),
+) -> dict[str, str]:
+    classifier = services.detection.classifier
+    remote = getattr(classifier, "primary", classifier)  # FallbackClassifier wraps the remote one
+    if isinstance(remote, DatabricksClassifier):
+        return {"status": await run_in_threadpool(remote.wake)}
+    return {"status": classifier.status}
 
 
 @router.post(

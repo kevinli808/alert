@@ -62,6 +62,12 @@ async function request<T>(
 
 export const getHealth = () => request<BackendHealth>('/health')
 
+// Starts the sound model as soon as the microphone turns on. On Databricks the model endpoint
+// scales to zero while nobody listens; "waking" means detection chunks return model_unavailable
+// for up to about a minute, after which the chunks themselves keep it awake.
+export const wakeModel = (getToken?: TokenGetter) =>
+  request<{ status: 'ready' | 'waking' | string }>('/api/wake-model', { method: 'POST' }, getToken)
+
 export function detectSound(wav: Blob, getToken?: TokenGetter, signal?: AbortSignal) {
   const form = new FormData()
   form.append('audio', wav, 'chunk.wav') // let the browser set the multipart boundary

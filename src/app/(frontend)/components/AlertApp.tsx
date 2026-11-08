@@ -21,6 +21,7 @@ import {
   encodeWav,
   getAccessToken,
   getHealth,
+  wakeModel,
   recordLogin,
   setAccessTokenGetter,
   startChunkCapture,
@@ -1198,6 +1199,9 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const detectBusyRef = useRef(false)
   const detectPausedUntilRef = useRef(0)
   const micSessionRef = useRef(0)
+  // True while the server says the model is still starting (e.g. Databricks waking from scale-to-zero).
+  // /health cannot see that, so it must not flip the status back to "ready" until a chunk succeeds.
+  const modelWakingRef = useRef(false)
 
   const checkBackend = useCallback(async () => {
     try {
@@ -1207,7 +1211,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
         health.anonymous_detection || (health.auth_configured && (await getAccessToken()))
       if (allowed) {
         const model = health.model.status
-        setBackendStatus(model === 'ready' ? 'ready' : model === 'failed' ? 'error' : 'loading')
+        if (model === 'ready' && modelWakingRef.current) setBackendStatus('loading')
+        else setBackendStatus(model === 'ready' ? 'ready' : model === 'failed' ? 'error' : 'loading')
       } else {
         setBackendStatus('login-required')
       }
@@ -1226,6 +1231,7 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   }, [backendStatus, checkBackend])
 
   const handleDetection = useCallback((result: DetectionResult) => {
+    modelWakingRef.current = false
     setBackendStatus('ready')
     if (!result.detected || !result.sound_type) return
     const ruleId = BACKEND_SOUND_TO_RULE[result.sound_type]
@@ -1252,6 +1258,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
           setBackendStatus('login-required')
           detectPausedUntilRef.current = Date.now() + 10000
         } else if (error.code === 'model_unavailable') {
+          // Model still starting: keep sending chunks; they keep the endpoint awake once it is up.
+          modelWakingRef.current = true
           setBackendStatus('loading')
         } else if (error.status === 429) {
           detectPausedUntilRef.current = Date.now() + (error.retryAfter ?? 5) * 1000
@@ -1512,6 +1520,18 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       void startChunkCapture(context, source, CHUNK_SECONDS, (samples) => {
         void sendChunk(samples, context.sampleRate, session)
       }).catch(() => setBackendStatus('error'))
+      // Mic on: start the sound model now (on Databricks it sleeps while nobody listens). The chunks
+      // that follow every 2 s keep it awake; once the mic is off it goes back to sleep by itself.
+      void wakeModel(getAccessToken)
+        .then((woken) => {
+          if (woken.status === 'waking' && session === micSessionRef.current) {
+            modelWakingRef.current = true
+            setBackendStatus('loading')
+          }
+        })
+        .catch(() => {
+          /* detection chunks report their own errors */
+        })
       void checkBackend()
       const sample = () => {
         analyser.getByteTimeDomainData(data)

@@ -62,7 +62,10 @@ class DatabricksClassifier(SoundClassifier):
         try:
             resp = self._client.post(self._url, json=payload)
         except httpx.TimeoutException as exc:
-            raise InferenceError("Databricks inference timed out") from exc
+            # With scale-to-zero, the first requests after an idle period wait while Databricks starts a
+            # replica (~1 min). That is "still starting", not a failure: the client keeps sending chunks,
+            # which keep the endpoint awake once it is up.
+            raise ModelUnavailableError("Sound model is waking up") from exc
         except httpx.HTTPError as exc:
             logger.warning("Databricks request error: %s", type(exc).__name__)
             raise InferenceError("Could not reach Databricks inference endpoint") from exc
@@ -73,8 +76,8 @@ class DatabricksClassifier(SoundClassifier):
             logger.warning("Databricks endpoint %s returned HTTP %s", self.endpoint_name, resp.status_code)
             if resp.status_code in (401, 403):
                 raise InferenceError("Databricks rejected the credentials")
-            if resp.status_code in (404, 503):
-                raise ModelUnavailableError("Databricks model endpoint is not available")
+            if resp.status_code in (404, 429, 503, 504):
+                raise ModelUnavailableError("Databricks model endpoint is not available yet")
             raise InferenceError("Databricks inference failed")
 
         try:
@@ -96,6 +99,21 @@ class DatabricksClassifier(SoundClassifier):
             model=f"databricks:{self.endpoint_name}",
             inference_ms=elapsed_ms,
         )
+
+    def wake(self, timeout_seconds: float = 3.0) -> str:
+        """Send one tiny request so a scaled-to-zero endpoint starts now. Returns "ready" or "waking".
+
+        Databricks starts scaling up when the request arrives, so a short timeout is fine: the caller
+        does not wait for the replica, it only kicks off the start.
+        """
+        if self._client is None:
+            return "not_configured"
+        payload = {"dataframe_records": [{"audio_b64": self.encode_waveform(np.zeros(16000, np.float32)), "sample_rate": 16000}]}
+        try:
+            resp = self._client.post(self._url, json=payload, timeout=timeout_seconds)
+        except httpx.HTTPError:
+            return "waking"
+        return "ready" if resp.status_code == 200 else "waking"
 
     def close(self) -> None:
         if self._client is not None:

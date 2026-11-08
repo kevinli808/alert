@@ -128,6 +128,21 @@ def test_rate_limit(settings, container, auth_headers):
         assert resp.status_code == 429 and int(resp.headers["retry-after"]) >= 1
 
 
+def test_wake_model_requires_login_and_reports_status(client, auth_headers):
+    assert client.post("/api/wake-model").status_code == 401
+    resp = client.post("/api/wake-model", headers=auth_headers())
+    assert resp.status_code == 200 and resp.json() == {"status": "ready"}  # local/scripted model
+
+
+def test_wake_model_wakes_databricks(client, auth_headers, container, monkeypatch):
+    from app.services.databricks_service import DatabricksClassifier
+
+    remote = DatabricksClassifier("https://dbc-1.cloud.databricks.com", "dapi-x", "yamnet-sound-alerts")
+    monkeypatch.setattr(remote, "wake", lambda: "waking")
+    container.detection.classifier = remote
+    assert client.post("/api/wake-model", headers=auth_headers()).json() == {"status": "waking"}
+
+
 def test_sound_types_public(client):
     types = client.get("/api/sound-types").json()["sound_types"]
     ids = {t["id"] for t in types}
@@ -137,7 +152,7 @@ def test_sound_types_public(client):
 def test_openapi_docs(client):
     assert client.get("/docs").status_code == 200
     paths = client.get("/openapi.json").json()["paths"]
-    for p in ["/api/users/me", "/api/detect-sound", "/api/sound-types"]:
+    for p in ["/api/users/me", "/api/detect-sound", "/api/sound-types", "/api/wake-model"]:
         assert p in paths
     assert "/api/settings" not in paths and "/api/alert-history" not in paths  # nothing else is stored
 
