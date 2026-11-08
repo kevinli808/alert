@@ -64,6 +64,33 @@ def test_record_login_sends_parameterized_sql_to_warehouse():
     assert len(sent) == 1 and sent[0][1]["statement"].startswith("SELECT")
 
 
+def test_profile_settings_use_separate_table_and_parameterized_user_id():
+    settings_json = '{"simple":true}'
+    sent = []
+
+    def handler(req: httpx.Request):
+        body = json.loads(req.content)
+        sent.append(body)
+        if body["statement"].startswith("SELECT"):
+            return httpx.Response(200, json=_succeeded([[settings_json]], columns=["settings_json"]))
+        return httpx.Response(200, json=_succeeded(columns=[]))
+
+    db = _sql_db_with(handler)
+    assert asyncio.run(db.get_settings("auth0|alice")) == {"simple": True}
+    assert "CREATE TABLE IF NOT EXISTS `main`.`alert`.`user_settings`" in sent[0]["statement"]
+    assert sent[1]["statement"].startswith("SELECT settings_json FROM `main`.`alert`.`user_settings`")
+    assert sent[1]["parameters"] == [{"name": "user_id", "type": "STRING", "value": "auth0|alice"}]
+
+    sent.clear()
+    asyncio.run(db.save_settings("auth0|alice", {"simple": False}))
+    merge = sent[0]
+    assert merge["statement"].startswith("MERGE INTO `main`.`alert`.`user_settings`")
+    assert "auth0|alice" not in merge["statement"] and '{"simple":false}' not in merge["statement"]
+    params = {item["name"]: item for item in merge["parameters"]}
+    assert params["user_id"]["value"] == "auth0|alice"
+    assert params["settings_json"]["value"] == '{"simple":false}'
+
+
 def test_statement_polls_while_warehouse_starts():
     calls = []
 

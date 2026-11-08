@@ -90,18 +90,19 @@ The backend verifies tokens locally with the cached JWKS
 `aud`, `exp`/`iat` with 30 s leeway, and `sub`. Passwords and sessions are handled entirely by Auth0.
 Session management means the SPA SDK refreshes tokens and logout clears the Auth0 session.
 
-## 3. Databricks users database
+## 3. Databricks account database
 
-The database records **users only**: one row per Auth0 account, written when the frontend calls
-`GET /api/users/me` after login. Alert settings stay in browser storage per profile on each device,
-and detections are not stored.
+The backend stores one profile and one settings record per Auth0 account. The profile is written
+when the frontend calls `GET /api/users/me`; settings are synchronized through
+`GET`/`POST /api/users/me/settings`. Both records are keyed by the verified access token's `sub`,
+not by a user id sent in the request. Unauthenticated settings are held in memory only and reset on
+refresh; the frontend does not write settings or preview account data to browser storage. Detections
+are not stored.
 
-| Column              | Meaning                                                        |
-| ------------------- | -------------------------------------------------------------- |
-| `id`                | Auth0 user id (the access token's `sub`)                       |
-| `email`, `username` | from the token claims (section 2, step 4) or Auth0 `/userinfo` |
-| `created_at`        | first login                                                    |
-| `last_login_at`     | most recent login                                              |
+The `users` table stores account metadata (`id`, `email`, `username`, `created_at`, and
+`last_login_at`). A separate `user_settings` table stores each account's validated Alert settings
+as JSON along with its last update time. The backend creates `user_settings` on first use; the
+Databricks principal must be allowed to create and modify tables in the configured schema.
 
 Create or use a Databricks workspace with a SQL warehouse.
 
@@ -110,15 +111,17 @@ Create or use a Databricks workspace with a SQL warehouse.
    at the end of **HTTP path** (`/sql/1.0/warehouses/<id>`) into `DATABRICKS_WAREHOUSE_ID`.
 2. **Token.** Your avatar → Settings → Developer → Access tokens → _Generate new token_. Put it in
    `DATABRICKS_TOKEN`. It stays in `backend/.env` only, never in frontend code.
-3. **Table.** Open SQL Editor, choose the warehouse, and run [sql/databricks_users.sql](sql/databricks_users.sql).
-   It creates the `workspace.alert` schema and the `users` table. The backend also creates the table on
-   first use, so only the schema has to exist. For a different location set `DATABRICKS_USERS_TABLE`
-   (`catalog.schema.table`).
+3. **Tables.** Open SQL Editor, choose the warehouse, and run [sql/databricks_users.sql](sql/databricks_users.sql).
+   It creates the `workspace.alert` schema and the `users` table. The backend creates the
+   `user_settings` table on first use, so only the schema must exist beforehand. For a different
+   location set `DATABRICKS_USERS_TABLE` (`catalog.schema.table`); settings use the same catalog and
+   schema with the table name `user_settings`.
 4. Restart the backend. `/health` shows `"database_configured": true`.
 
-**How access control works.** The browser never talks to Databricks. FastAPI verifies the Auth0 token and
-writes the row keyed by that token's `sub`; the user id is never taken from the request. All values
-are sent as SQL statement parameters, and the table name is validated as an identifier at startup.
+**How access control works.** The browser never talks to Databricks. FastAPI verifies the Auth0 token
+and reads or writes records keyed by that token's `sub`; the user id is never taken from the request.
+Settings have strict field, size, and relationship validation. SQL values are sent as statement
+parameters, and table names are validated as identifiers at startup.
 
 A stopped serverless warehouse takes a few seconds to wake up, and a classic one can take minutes.
 Requests wait up to `DATABASE_TIMEOUT_SECONDS` (default 30) and then return `503 database_unavailable`;

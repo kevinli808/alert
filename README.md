@@ -20,9 +20,12 @@ use authenticated detection and account features.
 - Auth0 provides sign-in. The backend verifies access tokens and records
   account metadata in a Databricks SQL table.
 
-Audio recordings and sound detections are not stored by the backend. Alert
-preferences are saved in browser storage per profile on each device; they are
-not synced between devices.
+Audio recordings and sound detections are not stored by the backend. Signed-in
+users' Alert preferences sync with their account through the backend database.
+No Alert preferences or local-preview account data are written to browser
+storage. Without an authenticated account, settings use defaults and reset when
+the page is refreshed. If account sync is unavailable, the settings screen
+reports the error and does not claim changes were saved.
 
 ## Project layout
 

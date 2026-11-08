@@ -20,12 +20,15 @@ import {
   detectSound,
   encodeWav,
   getAccessToken,
+  getProfileSettings,
   getHealth,
   wakeModel,
   recordLogin,
+  saveProfileSettings,
   setAccessTokenGetter,
   startChunkCapture,
   type DetectionResult,
+  type ProfileSettings,
 } from '../lib/alert-api'
 
 const CHUNK_SECONDS = 2
@@ -68,18 +71,9 @@ type Detection = {
   live: boolean
   confidence?: number
 }
-type StoredSettings = {
-  simple: boolean
-  rules: SoundRule[]
-  customStates: VisualState[]
-  stateOrder: string[]
-  selectedRuleId: string
-  priorityCollapsed: boolean
-  introComplete: boolean
-}
-
-const STORAGE_KEY = 'alert-settings-v2'
-const ACCOUNT_KEY = 'alert-account-v1'
+type StoredSettings = ProfileSettings
+type SettingsSyncStatus = 'loading' | 'synced' | 'saving' | 'not-saved' | 'local' | 'error'
+type SettingsLoadStatus = 'loading' | 'ready' | 'error'
 
 const SYSTEM_STATES: VisualState[] = [
   { id: 'default', name: 'Default', color: '#2dd4bf', priority: 0, duration: 0, system: true },
@@ -223,27 +217,6 @@ const DEFAULT_SETTINGS: StoredSettings = {
   selectedRuleId: DEFAULT_RULES[0].id,
   priorityCollapsed: false,
   introComplete: false,
-}
-
-function loadSettings(storageKey: string): StoredSettings {
-  if (typeof window === 'undefined') return DEFAULT_SETTINGS
-  try {
-    let serialized = localStorage.getItem(storageKey)
-    if (!serialized) {
-      const legacySettings = localStorage.getItem(STORAGE_KEY)
-      const guestSettings = localStorage.getItem(`${STORAGE_KEY}:guest`)
-      serialized = legacySettings || guestSettings
-      if (serialized) {
-        localStorage.setItem(storageKey, serialized)
-        if (legacySettings) localStorage.removeItem(STORAGE_KEY)
-        if (guestSettings && storageKey !== `${STORAGE_KEY}:guest`)
-          localStorage.removeItem(`${STORAGE_KEY}:guest`)
-      }
-    }
-    return normalizeSettings(JSON.parse(serialized || '{}'))
-  } catch {
-    return DEFAULT_SETTINGS
-  }
 }
 
 /** Repairs settings from any source (this browser or the backend) into a consistent shape. */
@@ -1190,10 +1163,12 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const [localAccount, setLocalAccount] = useState<{ name: string; email: string } | null>(null)
   const account = auth ? auth.user : localAccount
   const accountKey = auth ? (auth.user?.id ?? null) : (localAccount?.email ?? null)
-  const settingsStorageKey = `${STORAGE_KEY}:${accountKey ? encodeURIComponent(accountKey) : 'guest'}`
+  const settingsOwnerKey = auth?.user?.id ?? 'guest'
   const [accountReady, setAccountReady] = useState(false)
   const [loadedSettingsKey, setLoadedSettingsKey] = useState<string | null>(null)
-  const settingsReady = accountReady && loadedSettingsKey === settingsStorageKey
+  const [settingsLoadStatus, setSettingsLoadStatus] = useState<SettingsLoadStatus>('loading')
+  const settingsReady =
+    accountReady && settingsLoadStatus === 'ready' && loadedSettingsKey === settingsOwnerKey
   const [accountMode, setAccountMode] = useState<'login' | 'create'>('login')
   const [listening, setListening] = useState<ListeningState>('paused')
   const [audioLevel, setAudioLevel] = useState(0)
@@ -1203,7 +1178,9 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const [pendingAlerts, setPendingAlerts] = useState<AlertRequest[]>([])
   const [selectedId, setSelectedId] = useState(DEFAULT_SETTINGS.selectedRuleId)
   const [priorityCollapsed, setPriorityCollapsed] = useState(DEFAULT_SETTINGS.priorityCollapsed)
-  const [saveStatus, setSaveStatus] = useState<'saved' | 'error'>('saved')
+  const [settingsSyncStatus, setSettingsSyncStatus] = useState<SettingsSyncStatus>('loading')
+  const [settingsRetry, setSettingsRetry] = useState(0)
+  const [settingsLoadRetry, setSettingsLoadRetry] = useState(0)
   const [phraseDraft, setPhraseDraft] = useState('')
   const [showPhraseForm, setShowPhraseForm] = useState(false)
   const [editingStateId, setEditingStateId] = useState<string | null>(null)
@@ -1215,6 +1192,7 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const audioRef = useRef<{ context: AudioContext; stream: MediaStream; frame: number } | null>(
     null,
   )
+  const lastSyncedSettingsRef = useRef<string | null>(null)
   const waveformSamplesRef = useRef<Uint8Array | null>(null)
   const simpleRef = useRef(simple)
   const activeRef = useRef<ActiveAlert | null>(null)
@@ -1238,7 +1216,8 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       if (allowed) {
         const model = health.model.status
         if (model === 'ready' && modelWakingRef.current) setBackendStatus('loading')
-        else setBackendStatus(model === 'ready' ? 'ready' : model === 'failed' ? 'error' : 'loading')
+        else
+          setBackendStatus(model === 'ready' ? 'ready' : model === 'failed' ? 'error' : 'loading')
       } else {
         setBackendStatus('login-required')
       }
@@ -1338,38 +1317,60 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
       if (!auth.loading) setAccountReady(true)
       return
     }
-    try {
-      const saved = JSON.parse(localStorage.getItem(ACCOUNT_KEY) || 'null') as {
-        name: string
-        email: string
-      } | null
-      setLocalAccount(saved)
-    } catch {
-      setLocalAccount(null)
-    } finally {
-      setAccountReady(true)
-    }
+    setAccountReady(true)
   }, [auth])
 
   useEffect(() => {
     if (!accountReady) {
       setLoadedSettingsKey(null)
+      setSettingsLoadStatus('loading')
       return
     }
-    const restored = loadSettings(settingsStorageKey)
-    setSimple(restored.simple)
-    setRules(restored.rules)
-    setCustomStates(restored.customStates)
-    setStateOrder(restored.stateOrder)
-    setSelectedId(
-      restored.rules.some((rule) => rule.id === restored.selectedRuleId)
-        ? restored.selectedRuleId
-        : (restored.rules[0]?.id ?? ''),
-    )
-    setPriorityCollapsed(restored.priorityCollapsed)
-    setIntroComplete(restored.introComplete)
-    setLoadedSettingsKey(settingsStorageKey)
-  }, [accountReady, settingsStorageKey])
+    let cancelled = false
+    const restore = async () => {
+      setSettingsLoadStatus('loading')
+      let restored = DEFAULT_SETTINGS
+      let syncStatus: SettingsSyncStatus = 'local'
+      lastSyncedSettingsRef.current = null
+      if (auth?.user) {
+        syncStatus = 'loading'
+        try {
+          const response = await getProfileSettings(getAccessToken)
+          if (response.settings) {
+            restored = normalizeSettings(response.settings)
+            syncStatus = 'synced'
+          } else {
+            syncStatus = 'not-saved'
+          }
+          lastSyncedSettingsRef.current = JSON.stringify(restored)
+        } catch {
+          if (cancelled) return
+          setSettingsSyncStatus('error')
+          setSettingsLoadStatus('error')
+          return
+        }
+      }
+      if (cancelled) return
+      setSimple(restored.simple)
+      setRules(restored.rules)
+      setCustomStates(restored.customStates)
+      setStateOrder(restored.stateOrder)
+      setSelectedId(
+        restored.rules.some((rule) => rule.id === restored.selectedRuleId)
+          ? restored.selectedRuleId
+          : (restored.rules[0]?.id ?? ''),
+      )
+      setPriorityCollapsed(restored.priorityCollapsed)
+      setIntroComplete(restored.introComplete)
+      setSettingsSyncStatus(syncStatus)
+      setLoadedSettingsKey(settingsOwnerKey)
+      setSettingsLoadStatus('ready')
+    }
+    void restore()
+    return () => {
+      cancelled = true
+    }
+  }, [accountReady, auth?.user?.id, settingsOwnerKey, settingsLoadRetry])
 
   const settings = useMemo<StoredSettings>(
     () => ({
@@ -1399,14 +1400,31 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   }, [auth, accountKey])
 
   useEffect(() => {
-    if (!accountReady || loadedSettingsKey !== settingsStorageKey) return
-    try {
-      localStorage.setItem(settingsStorageKey, JSON.stringify(settings))
-      setSaveStatus('saved')
-    } catch {
-      setSaveStatus('error')
+    if (!settingsReady || !auth?.user) {
+      if (settingsReady) setSettingsSyncStatus('local')
+      return
     }
-  }, [accountReady, loadedSettingsKey, settings, settingsStorageKey])
+    const serialized = JSON.stringify(settings)
+    if (lastSyncedSettingsRef.current === serialized) return
+    let cancelled = false
+    const timeout = window.setTimeout(() => {
+      setSettingsSyncStatus('saving')
+      void saveProfileSettings(settings, getAccessToken)
+        .then(() => {
+          if (!cancelled) {
+            lastSyncedSettingsRef.current = serialized
+            setSettingsSyncStatus('synced')
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setSettingsSyncStatus('error')
+        })
+    }, 350)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeout)
+    }
+  }, [auth?.user?.id, settings, settingsReady, settingsRetry])
 
   const stateDuration = useCallback(
     (stateId: string) => {
@@ -1798,7 +1816,6 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     const email = String(form.get('email'))
     const name = String(form.get('name') || email.split('@')[0])
     const next = { name, email }
-    localStorage.setItem(ACCOUNT_KEY, JSON.stringify(next))
     setLocalAccount(next)
     setDialog(null)
     if (accountMode === 'create' && !introComplete) {
@@ -2073,34 +2090,64 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
             </div>
             <div className="save-actions">
               <span
-                className={saveStatus === 'error' ? 'save-error' : ''}
+                className={settingsSyncStatus === 'error' ? 'save-error' : ''}
                 role="status"
                 aria-live="polite"
               >
                 {!settingsReady
-                  ? 'Loading settings…'
-                  : saveStatus === 'error'
-                    ? 'Unable to save on this device'
-                    : 'Saved on this device'}
+                  ? settingsLoadStatus === 'error'
+                    ? 'Could not load your account settings'
+                    : 'Loading settings…'
+                  : !auth?.user
+                    ? 'Not signed in — settings reset on refresh'
+                    : settingsSyncStatus === 'saving'
+                      ? 'Saving to your account…'
+                      : settingsSyncStatus === 'error'
+                        ? 'Sync failed — changes are not saved'
+                        : settingsSyncStatus === 'synced'
+                          ? 'Saved to your account'
+                          : 'Not saved yet'}
               </span>
+              {settingsLoadStatus === 'error' && auth?.user ? (
+                <button
+                  type="button"
+                  onClick={() => setSettingsLoadRetry((attempt) => attempt + 1)}
+                >
+                  Retry loading
+                </button>
+              ) : settingsSyncStatus === 'error' && auth?.user ? (
+                <button type="button" onClick={() => setSettingsRetry((attempt) => attempt + 1)}>
+                  Retry sync
+                </button>
+              ) : null}
               <button type="button" onClick={resetSettings}>
                 Reset defaults
               </button>
             </div>
           </header>
-          <div className={`configuration-body ${priorityCollapsed ? 'priority-is-collapsed' : ''}`}>
-            <StatePriorityPanel
-              states={states}
-              collapsed={priorityCollapsed}
-              onToggle={() => setPriorityCollapsed((value) => !value)}
-              onReorder={reorderStates}
-              onEdit={openEditState}
-              onDelete={deleteCustomState}
-            />
-            <div className="editor-area">
-              {simple ? <SimpleEditor {...editorProps} /> : <NodeEditor {...editorProps} />}
+          {!settingsReady ? (
+            <p className="empty-state">
+              {settingsLoadStatus === 'error'
+                ? 'Your account settings could not be loaded. Retry before making changes.'
+                : 'Loading your profile settings…'}
+            </p>
+          ) : (
+            <div
+              className={`configuration-body ${priorityCollapsed ? 'priority-is-collapsed' : ''}`}
+            >
+              <StatePriorityPanel
+                states={states}
+                collapsed={priorityCollapsed}
+                onToggle={() => setPriorityCollapsed((value) => !value)}
+                onReorder={reorderStates}
+                onEdit={openEditState}
+                onDelete={deleteCustomState}
+              />
+              <div className="editor-area">
+                {simple ? <SimpleEditor {...editorProps} /> : <NodeEditor {...editorProps} />}
+              </div>
             </div>
-          </div>
+          )}
           <footer className="integration-footer">
             <span>Detection status</span>
             <p>
@@ -2158,7 +2205,6 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
                     auth.logout()
                     return
                   }
-                  localStorage.removeItem(ACCOUNT_KEY)
                   setLocalAccount(null)
                 }}
               >

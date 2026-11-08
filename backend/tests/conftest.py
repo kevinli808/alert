@@ -84,6 +84,7 @@ def make_token(rsa_key):
 class InMemoryDatabase(Database):
     def __init__(self) -> None:
         self.users: dict[str, dict[str, Any]] = {}
+        self.settings: dict[str, dict[str, Any]] = {}
 
     async def get_user(self, user_id):
         row = self.users.get(user_id)
@@ -98,6 +99,13 @@ class InMemoryDatabase(Database):
         else:
             row.update(email=email or row["email"], username=username or row["username"], last_login_at=now)
         return dict(row)
+
+    async def get_settings(self, user_id):
+        stored = self.settings.get(user_id)
+        return dict(stored) if stored else None
+
+    async def save_settings(self, user_id, settings):
+        self.settings[user_id] = dict(settings)
 
 
 # ---------------------------------------------------------------- classifier -------------

@@ -24,6 +24,33 @@ export type DetectionResult = {
   event_id: string | null
 }
 
+export type ProfileSettings = {
+  simple: boolean
+  rules: Array<{
+    id: string
+    label: string
+    kind: 'sound' | 'phrase'
+    enabled: boolean
+    effects: string[]
+    ttsResponse?: string
+    lightColor?: string
+  }>
+  customStates: Array<{
+    id: string
+    name: string
+    color: string
+    priority: 0 | 1 | 2
+    duration: number
+    system?: boolean
+  }>
+  stateOrder: string[]
+  selectedRuleId: string
+  priorityCollapsed: boolean
+  introComplete: boolean
+}
+
+type ProfileSettingsResponse = { settings: ProfileSettings | null }
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -78,8 +105,7 @@ export function detectSound(wav: Blob, getToken?: TokenGetter, signal?: AbortSig
   )
 }
 
-// The backend's database records users only (Databricks users table). Calling this after login
-// creates the user on first login and updates last_login_at afterwards. Settings stay in the browser.
+// Calling this after login records the account in Databricks and updates last_login_at.
 export type UserRecord = {
   id: string
   email: string | null
@@ -88,7 +114,23 @@ export type UserRecord = {
   last_login_at: string
 }
 
-export const recordLogin = (getToken: TokenGetter) => request<UserRecord>('/api/users/me', {}, getToken)
+export const recordLogin = (getToken: TokenGetter) =>
+  request<UserRecord>('/api/users/me', {}, getToken)
+
+export const getProfileSettings = (getToken: TokenGetter) =>
+  request<ProfileSettingsResponse>('/api/users/me/settings', {}, getToken)
+
+export const saveProfileSettings = (settings: ProfileSettings, getToken: TokenGetter) =>
+  request<ProfileSettingsResponse>(
+    '/api/users/me/settings',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+      keepalive: true,
+    },
+    getToken,
+  )
 
 // --------------------------------------------------------------- login (Auth0) ---------
 // Public identifiers only (no secrets). Set them in .env.local; audience must equal the backend's

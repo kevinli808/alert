@@ -1,7 +1,7 @@
-"""User records stored in a Databricks SQL table, via the SQL Statement Execution API.
+"""User records and per-user settings stored in Databricks SQL.
 
-The database records one thing: who has logged in. Each row is keyed by the Auth0 `sub` of the
-verified access token. The user id is never taken from the request body.
+Each record is keyed by the Auth0 `sub` of the verified access token. The user id is never taken
+from the request body.
 
 Every value is sent as a named statement parameter (never string-formatted into SQL). The table
 name is the only interpolated piece, and it is validated as a plain identifier at startup.
@@ -10,6 +10,7 @@ name is the only interpolated piece, and it is validated as a plain identifier a
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -44,6 +45,12 @@ class Database(ABC):
     async def record_login(self, user_id: str, email: str | None, username: str | None) -> dict[str, Any]:
         """Create the user on first login; afterwards refresh last_login_at (and fill in missing email/name)."""
 
+    @abstractmethod
+    async def get_settings(self, user_id: str) -> dict[str, Any] | None: ...
+
+    @abstractmethod
+    async def save_settings(self, user_id: str, settings: dict[str, Any]) -> None: ...
+
     async def aclose(self) -> None:  # pragma: no cover - default no-op
         return None
 
@@ -60,9 +67,12 @@ class DatabricksDatabase(Database):
     ) -> None:
         self._warehouse_id = warehouse_id
         self._table = quote_table_name(table)
+        settings_table = ".".join([*table.strip().split(".")[:-1], "user_settings"])
+        self._settings_table = quote_table_name(settings_table)
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._table_ready = False
+        self._settings_table_ready = False
         self._client = httpx.AsyncClient(
             base_url=host.rstrip("/"),
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -167,3 +177,45 @@ class DatabricksDatabase(Database):
         if user is None:
             raise DatabaseError("Could not record user")
         return user
+
+    async def _ensure_settings_table(self) -> None:
+        if self._settings_table_ready:
+            return
+        await self._execute(
+            f"CREATE TABLE IF NOT EXISTS {self._settings_table} ("
+            "user_id STRING NOT NULL COMMENT 'Auth0 user id from the verified access token', "
+            "settings_json STRING NOT NULL, "
+            "updated_at TIMESTAMP NOT NULL"
+            ") COMMENT 'Alert preferences, one row per Auth0 account'"
+        )
+        self._settings_table_ready = True
+
+    async def get_settings(self, user_id: str) -> dict[str, Any] | None:
+        await self._ensure_settings_table()
+        rows = await self._execute(
+            f"SELECT settings_json FROM {self._settings_table} WHERE user_id = :user_id LIMIT 1",
+            {"user_id": user_id},
+        )
+        if not rows:
+            return None
+        try:
+            settings = json.loads(rows[0]["settings_json"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            logger.error("Stored settings are invalid for an account")
+            raise DatabaseError("Stored settings could not be read") from exc
+        if not isinstance(settings, dict):
+            raise DatabaseError("Stored settings have an invalid format")
+        return settings
+
+    async def save_settings(self, user_id: str, settings: dict[str, Any]) -> None:
+        await self._ensure_settings_table()
+        await self._execute(
+            f"MERGE INTO {self._settings_table} AS s "
+            "USING (SELECT :user_id AS user_id, :settings_json AS settings_json) AS incoming "
+            "ON s.user_id = incoming.user_id "
+            "WHEN MATCHED THEN UPDATE SET "
+            "s.settings_json = incoming.settings_json, s.updated_at = current_timestamp() "
+            "WHEN NOT MATCHED THEN INSERT (user_id, settings_json, updated_at) "
+            "VALUES (incoming.user_id, incoming.settings_json, current_timestamp())",
+            {"user_id": user_id, "settings_json": json.dumps(settings, separators=(",", ":"))},
+        )

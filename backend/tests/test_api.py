@@ -48,6 +48,64 @@ def test_users_me_requires_login(client):
     assert client.get("/api/users/me").status_code == 401
 
 
+def test_profile_settings_are_saved_and_scoped_to_verified_account(client, auth_headers, db):
+    settings = {
+        "simple": False,
+        "rules": [
+            {"id": "doorbell", "label": "Doorbell", "kind": "sound", "enabled": True,
+             "effects": ["warning", "vibration"], "ttsResponse": "Someone is here"},
+        ],
+        "customStates": [
+            {"id": "custom-blue", "name": "Blue", "color": "#112233", "priority": 2, "duration": 5000},
+        ],
+        "stateOrder": ["urgent", "warning", "custom-blue", "default"],
+        "selectedRuleId": "doorbell",
+        "priorityCollapsed": True,
+        "introComplete": True,
+    }
+
+    saved = client.post("/api/users/me/settings", headers=auth_headers("auth0|alice"), json=settings)
+    assert saved.status_code == 200 and saved.json()["settings"] == settings
+    assert client.get("/api/users/me/settings", headers=auth_headers("auth0|alice")).json() == {
+        "settings": settings
+    }
+    assert client.get("/api/users/me/settings", headers=auth_headers("auth0|bob")).json() == {
+        "settings": None
+    }
+    assert db.settings == {"auth0|alice": settings}
+
+
+def test_profile_settings_require_login_and_reject_invalid_values(client, auth_headers, db):
+    settings = {
+        "simple": True,
+        "rules": [
+            {"id": "doorbell", "label": "Doorbell", "kind": "sound", "enabled": True,
+             "effects": ["unrecognized-effect"]},
+        ],
+        "customStates": [],
+        "stateOrder": ["urgent", "warning", "default"],
+        "selectedRuleId": "doorbell",
+        "priorityCollapsed": False,
+        "introComplete": False,
+    }
+    assert client.get("/api/users/me/settings").status_code == 401
+    response = client.post("/api/users/me/settings", headers=auth_headers(), json=settings)
+    assert response.status_code == 422
+    assert db.settings == {}
+
+
+def test_profile_settings_reject_unrecognized_fields(client, auth_headers, db):
+    response = client.post(
+        "/api/users/me/settings",
+        headers=auth_headers(),
+        json={"simple": True, "rules": [], "customStates": [], "stateOrder": [],
+              "selectedRuleId": "missing", "priorityCollapsed": False, "introComplete": False,
+              "accountId": "auth0|another-user"},
+    )
+    assert response.status_code == 422
+    assert db.settings == {}
+
+
 def test_users_me_503_without_database(settings, container, auth_headers):
     from fastapi.testclient import TestClient
     from app.main import create_app
@@ -152,9 +210,9 @@ def test_sound_types_public(client):
 def test_openapi_docs(client):
     assert client.get("/docs").status_code == 200
     paths = client.get("/openapi.json").json()["paths"]
-    for p in ["/api/users/me", "/api/detect-sound", "/api/sound-types", "/api/wake-model"]:
+    for p in ["/api/users/me", "/api/users/me/settings", "/api/detect-sound", "/api/sound-types", "/api/wake-model"]:
         assert p in paths
-    assert "/api/settings" not in paths and "/api/alert-history" not in paths  # nothing else is stored
+    assert "/api/settings" not in paths and "/api/alert-history" not in paths
 
 
 # ------------------------------------------------- local dev: anonymous detection ----------
