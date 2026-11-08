@@ -275,8 +275,24 @@ for judging. If you do deploy:
 - **One worker:** run a single worker or instance. The rate limiter and event cooldown are in
   memory. Moving them to Redis is the upgrade path if you ever need several instances.
 - **Auth0:** add the deployed frontend URL to the Auth0 SPA callback, logout and web-origin lists.
-- **Frontend:** set the React `VITE_API_URL` to the backend URL.
+- **Frontend:** set `NEXT_PUBLIC_API_URL` to the backend URL when it is on a different origin.
 - **HTTPS:** required, since browsers only allow microphone access on HTTPS or `localhost`.
+
+### Vercel
+
+The Vercel backend service installs `requirements.txt`, which deliberately excludes TensorFlow;
+TensorFlow is too large for a standard Vercel Python function bundle. The Vercel deployment
+therefore defaults to Databricks inference and disables local-model fallback. Create a working
+Databricks Model Serving endpoint and configure `ENVIRONMENT=production`, `AUTH0_DOMAIN`,
+`AUTH0_AUDIENCE`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `INFERENCE_PROVIDER=databricks`,
+`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and `DATABRICKS_ENDPOINT_NAME` on the backend service.
+Missing required production settings cause startup validation to fail rather than running with
+insecure or nonfunctional defaults. Keep `DATABRICKS_FALLBACK_TO_LOCAL=false` and
+`PRELOAD_MODEL=false`.
+
+Local development installs `requirements-dev.txt`, which also installs
+`requirements-local.txt` for local YAMNet inference. Do not add TensorFlow back to
+`requirements.txt`, or Vercel deployments may exceed the Python function bundle limit.
 
 ## 9. Security notes
 

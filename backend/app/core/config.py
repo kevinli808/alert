@@ -6,6 +6,7 @@ Every secret is a ``SecretStr`` so it is never printed in logs or reprs.
 from __future__ import annotations
 
 import json
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -20,7 +21,9 @@ class Settings(BaseSettings):
 
     # --- General -----------------------------------------------------------------
     app_name: str = "Alert API"
-    environment: Literal["development", "production", "test"] = "development"
+    environment: Literal["development", "production", "test"] = Field(
+        default_factory=lambda: "production" if os.getenv("VERCEL") else "development"
+    )
     log_level: str = "INFO"
     # Comma-separated list of allowed frontend origins (no wildcards in production).
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173"
@@ -50,10 +53,12 @@ class Settings(BaseSettings):
     silence_rms_threshold: float = Field(default=0.003, ge=0, le=1)
 
     # --- Inference -----------------------------------------------------------------
-    inference_provider: Literal["local", "databricks"] = "local"
+    inference_provider: Literal["local", "databricks"] = Field(
+        default_factory=lambda: "databricks" if os.getenv("VERCEL") else "local"
+    )
     yamnet_model_handle: str = "https://tfhub.dev/google/yamnet/1"
     score_aggregation: Literal["max", "mean"] = "max"
-    preload_model: bool = True
+    preload_model: bool = Field(default_factory=lambda: not bool(os.getenv("VERCEL")))
 
     # --- Prediction processing ----------------------------------------------------
     confidence_threshold: float = Field(default=0.75, ge=0, le=1)
@@ -67,7 +72,7 @@ class Settings(BaseSettings):
     databricks_token: SecretStr = SecretStr("")
     databricks_endpoint_name: str = ""  # only for INFERENCE_PROVIDER=databricks
     databricks_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
-    databricks_fallback_to_local: bool = True
+    databricks_fallback_to_local: bool = Field(default_factory=lambda: not bool(os.getenv("VERCEL")))
 
     # --- Rate limiting (per authenticated user, per minute) -------------------------
     rate_limit_detect_per_minute: int = Field(default=120, ge=1)
@@ -78,6 +83,11 @@ class Settings(BaseSettings):
     def _strip_domain(cls, value: str) -> str:
         value = value.strip().removeprefix("https://").removeprefix("http://")
         return value.rstrip("/")
+
+    @field_validator("auth0_audience")
+    @classmethod
+    def _strip_audience(cls, value: str) -> str:
+        return value.strip().rstrip("/")
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -139,6 +149,10 @@ class Settings(BaseSettings):
                 missing.append("DATABRICKS_HOST/DATABRICKS_TOKEN/DATABRICKS_WAREHOUSE_ID")
             if self.inference_provider == "databricks" and not self.databricks_configured:
                 missing.append("DATABRICKS_HOST/DATABRICKS_TOKEN/DATABRICKS_ENDPOINT_NAME")
+            if os.getenv("VERCEL") and self.inference_provider != "databricks":
+                raise ValueError("Vercel deployments require INFERENCE_PROVIDER=databricks")
+            if os.getenv("VERCEL") and self.databricks_fallback_to_local:
+                raise ValueError("Vercel deployments require DATABRICKS_FALLBACK_TO_LOCAL=false")
             if any("*" in o for o in self.cors_origin_list):
                 raise ValueError("Wildcard CORS origins are not allowed in production")
             if missing:
