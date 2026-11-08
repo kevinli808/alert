@@ -36,6 +36,12 @@
       }
     },
     {
+      "source": "/api/users/me/settings",
+      "destination": {
+        "service": "backend"
+      }
+    },
+    {
       "source": "/health",
       "destination": {
         "service": "backend"
