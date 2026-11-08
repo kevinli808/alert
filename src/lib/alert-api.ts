@@ -1,6 +1,7 @@
 // Browser client for the FastAPI backend in /backend. No secrets live here: the URL is public config.
 
-export const API_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/$/, '')
+// Empty means same-origin requests, routed to FastAPI by Vercel's /api and /health rewrites.
+export const API_URL = (process.env.NEXT_PUBLIC_API_URL || '').replace(/\/$/, '')
 
 export type BackendHealth = {
   status: 'ok' | 'degraded'
@@ -34,7 +35,11 @@ export class ApiError extends Error {
 /** Returns an Auth0 access token once login is wired up; null means "not logged in". */
 export type TokenGetter = () => Promise<string | null>
 
-async function request<T>(path: string, init: RequestInit = {}, getToken?: TokenGetter): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  getToken?: TokenGetter,
+): Promise<T> {
   const token = getToken ? await getToken().catch(() => null) : null
   const res = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -57,7 +62,11 @@ export const getHealth = () => request<BackendHealth>('/health')
 export function detectSound(wav: Blob, getToken?: TokenGetter, signal?: AbortSignal) {
   const form = new FormData()
   form.append('audio', wav, 'chunk.wav') // let the browser set the multipart boundary
-  return request<DetectionResult>('/api/detect-sound', { method: 'POST', body: form, signal }, getToken)
+  return request<DetectionResult>(
+    '/api/detect-sound',
+    { method: 'POST', body: form, signal },
+    getToken,
+  )
 }
 
 // The frontend's settings document is stored as-is by the backend (GET/PUT /api/settings,
@@ -70,7 +79,11 @@ export const getSettings = <T>(getToken: TokenGetter) =>
 export const putSettings = <T>(settings: T, getToken: TokenGetter) =>
   request<SettingsEnvelope<T>>(
     '/api/settings',
-    { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings }) },
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings }),
+    },
     getToken,
   )
 
