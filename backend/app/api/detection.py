@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.core.errors import PayloadTooLargeError, UnsupportedMediaTypeError
-from app.dependencies.auth import ANONYMOUS_USER_ID, get_detection_user, rate_limit
+from app.dependencies.auth import get_detection_user, rate_limit
 from app.dependencies.services import get_services
 from app.schemas.common import error_responses
 from app.schemas.detection import (
@@ -19,7 +19,6 @@ from app.schemas.detection import (
 from app.services.auth_service import AuthenticatedUser
 from app.services.container import ServiceContainer
 from app.services.prediction_processor import DetectionOutcome
-from app.services.profile_service import ensure_profile_exists
 from app.services.sound_categories import SOUND_CATEGORIES
 
 logger = logging.getLogger(__name__)
@@ -61,7 +60,6 @@ def list_sound_types(services: ServiceContainer = Depends(get_services)) -> Soun
     responses=error_responses(401, 413, 415, 422, 429, 502, 503),
 )
 async def detect_sound(
-    background: BackgroundTasks,
     audio: UploadFile = File(..., description="Audio chunk (WAV/FLAC/OGG; WebM/MP4 if ffmpeg is installed)"),
     user: AuthenticatedUser = Depends(get_detection_user),
     _rl: None = Depends(rate_limit("detect", detection=True)),
@@ -78,30 +76,9 @@ async def detect_sound(
 
     # CPU-bound decode + inference runs in a worker thread so the event loop stays responsive.
     outcome = await run_in_threadpool(services.detection.detect, data, user.user_id)
-    del data  # raw audio is never persisted or logged
-
-    if (
-        outcome.detected
-        and outcome.is_new_event
-        and user.user_id != ANONYMOUS_USER_ID  # local dev mode: nothing to attach history to
-        and services.database is not None
-        and services.settings.record_history
-    ):
-        background.add_task(_record_history, services, user, outcome)
+    del data  # raw audio is never persisted or logged; detections are not stored either
 
     return _to_response(outcome)
-
-
-async def _record_history(services: ServiceContainer, user: AuthenticatedUser, outcome: DetectionOutcome) -> None:
-    """Runs after the response is sent; failure must never affect the alert itself."""
-    db = services.database
-    if db is None or outcome.sound_type is None:
-        return
-    try:
-        await ensure_profile_exists(db, user, services)
-        await db.insert_alert_history(user.user_id, outcome.sound_type, outcome.confidence, outcome.timestamp)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not record alert history: %s", type(exc).__name__)
 
 
 def _to_response(o: DetectionOutcome) -> DetectionResponse:

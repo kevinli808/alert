@@ -21,8 +21,7 @@ import {
   encodeWav,
   getAccessToken,
   getHealth,
-  getSettings,
-  putSettings,
+  recordLogin,
   setAccessTokenGetter,
   startChunkCapture,
   type DetectionResult,
@@ -1312,61 +1311,27 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     () => ({ simple, rules, customStates, stateOrder, introComplete }),
     [customStates, introComplete, rules, simple, stateOrder],
   )
-  const settingsRef = useRef(settings)
-  settingsRef.current = settings
-  // Backend sync is on only for a logged-in user. lastSyncedRef avoids re-uploading what we just got.
-  const remoteSyncRef = useRef(false)
-  const lastSyncedRef = useRef('')
-
-  const applySettings = useCallback((next: StoredSettings) => {
-    setSimple(next.simple)
-    setRules(next.rules)
-    setCustomStates(next.customStates)
-    setStateOrder(next.stateOrder)
-    setIntroComplete(next.introComplete)
-    setSelectedId((id) => (next.rules.some((rule) => rule.id === id) ? id : (next.rules[0]?.id ?? '')))
-  }, [])
-
   useEffect(() => {
-    // On login: the account's saved settings win; a brand-new account starts from this browser's.
-    remoteSyncRef.current = false
-    if (!accountKey) return
-    let cancelled = false
+    // On a real Auth0 login, record the user in the backend's users table (Databricks).
+    // Best-effort: login and the app keep working if the backend or database is unavailable.
+    if (!auth || !accountKey) return
     void (async () => {
       try {
-        if (!(await getAccessToken())) return // no real login: settings stay in this browser
-        // Without a database the server can't store settings; keep them in this browser.
+        if (!(await getAccessToken())) return
         if (!(await getHealth()).database_configured) return
-        const remote = await getSettings<StoredSettings>(getAccessToken)
-        if (cancelled) return
-        if (remote.settings) {
-          const next = normalizeSettings(remote.settings)
-          lastSyncedRef.current = JSON.stringify(next)
-          applySettings(next)
-        } else {
-          await putSettings(settingsRef.current, getAccessToken)
-          lastSyncedRef.current = JSON.stringify(settingsRef.current)
-        }
-        if (!cancelled) remoteSyncRef.current = true
+        await recordLogin(getAccessToken)
       } catch {
-        if (!cancelled) setSaveStatus('error')
+        /* user is still logged in; the row is written on the next login */
       }
     })()
-    return () => {
-      cancelled = true
-    }
-  }, [accountKey, applySettings])
+  }, [auth, accountKey])
 
   useEffect(() => {
+    // Settings are saved in this browser only; the server stores users, nothing else.
     setSaveStatus('saving')
-    const timeout = window.setTimeout(async () => {
+    const timeout = window.setTimeout(() => {
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
-        const json = JSON.stringify(settings)
-        if (remoteSyncRef.current && json !== lastSyncedRef.current) {
-          await putSettings(settings, getAccessToken)
-          lastSyncedRef.current = json
-        }
         setSaveStatus('saved')
       } catch {
         setSaveStatus('error')

@@ -52,17 +52,3 @@ class SoundTypeInfo(BaseModel):
 
 class SoundTypesResponse(BaseModel):
     sound_types: list[SoundTypeInfo]
-
-
-class AlertHistoryItem(BaseModel):
-    id: str
-    sound_type: str
-    confidence: float
-    detected_at: datetime
-
-
-class AlertHistoryResponse(BaseModel):
-    items: list[AlertHistoryItem]
-    next_before: datetime | None = Field(
-        default=None, description="Pass as `before` to fetch the next (older) page; null when no more"
-    )

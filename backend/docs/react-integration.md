@@ -57,17 +57,8 @@ export function makeApi(getAccessTokenSilently) {
     return body;
   }
   return {
-    me: () => request("/api/users/me"),
+    me: () => request("/api/users/me"),                 // call once after login: records the user
     soundTypes: () => fetch(`${API_URL}/api/sound-types`).then((r) => r.json()),
-    getSettings: () => request("/api/settings"),
-    putSettings: (settings) =>
-      request("/api/settings", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ settings }),
-      }),
-    history: (params = {}) => request(`/api/alert-history?${new URLSearchParams(params)}`),
-    clearHistory: () => request("/api/alert-history", { method: "DELETE" }),
     detect: (wavBlob) => {
       const form = new FormData();
       form.append("audio", wavBlob, "chunk.wav");    // do NOT set Content-Type; the browser adds the boundary
@@ -169,8 +160,8 @@ export function useSoundMonitor(api, onDetection) {
 
 The backend returns only the sound type. What happens next is decided by the **frontend's settings
 model**: each sound rule points at a visual state (default / warning / urgent or a custom state with
-its own colour and duration) plus extra effects such as vibration. The backend stores that settings
-document unchanged per user (`GET`/`PUT /api/settings`) and does not interpret it.
+its own colour and duration) plus extra effects such as vibration. Those settings are saved in the
+browser (`localStorage`); the backend's database records users only.
 
 ```js
 // Backend category id -> frontend rule id (see BACKEND_SOUND_TO_RULE in src/lib/alert-api.ts)

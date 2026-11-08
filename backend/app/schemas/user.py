@@ -10,3 +10,4 @@ class UserProfile(BaseModel):
     email: str | None = None
     username: str | None = None
     created_at: datetime
+    last_login_at: datetime

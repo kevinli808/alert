@@ -11,8 +11,8 @@ def test_health(client):
 
 def test_cors_preflight_allows_frontend_origin(client):
     resp = client.options(
-        "/api/settings",
-        headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "PUT",
+        "/api/users/me",
+        headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "GET",
                  "Access-Control-Request-Headers": "authorization,content-type"},
     )
     assert resp.status_code == 200
@@ -21,77 +21,42 @@ def test_cors_preflight_allows_frontend_origin(client):
 
 def test_cors_rejects_unknown_origin(client):
     resp = client.options(
-        "/api/settings",
+        "/api/users/me",
         headers={"Origin": "https://evil.example.com", "Access-Control-Request-Method": "GET"},
     )
     assert "access-control-allow-origin" not in resp.headers
 
 
-def test_users_me_creates_profile_once(client, auth_headers, db):
+def test_users_me_records_user_once_and_updates_last_login(client, auth_headers, db):
     r1 = client.get("/api/users/me", headers=auth_headers("auth0|alice"))
     r2 = client.get("/api/users/me", headers=auth_headers("auth0|alice"))
     assert r1.status_code == r2.status_code == 200
-    assert r1.json()["id"] == "auth0|alice"
-    assert r1.json()["email"] == "alice@example.com"
-    assert len(db.profiles) == 1
+    first, second = r1.json(), r2.json()
+    assert first["id"] == "auth0|alice" and first["email"] == "alice@example.com"
+    assert first["username"] == "Test User"
+    assert second["created_at"] == first["created_at"]
+    assert second["last_login_at"] >= first["last_login_at"]
+    assert list(db.users) == ["auth0|alice"]
 
 
-FRONTEND_SETTINGS = {  # shape of StoredSettings in src/components/AlertApp.tsx
-    "simple": False,
-    "rules": [
-        {"id": "doorbell", "label": "Doorbell", "kind": "sound", "enabled": True, "effects": ["warning", "vibration"]},
-        {"id": "phrase-1", "label": "Watch out", "kind": "phrase", "enabled": True, "effects": ["custom-1", "tts"],
-         "ttsResponse": "On my way", "lightColor": "#2DD4BF"},
-    ],
-    "customStates": [{"id": "custom-1", "name": "Information", "color": "#4F7FD8", "priority": 1, "duration": 4000}],
-    "stateOrder": ["urgent", "custom-1", "warning", "default"],
-    "introComplete": True,
-}
+def test_users_are_keyed_by_token_not_request(client, auth_headers, db):
+    client.get("/api/users/me?id=auth0|mallory", headers=auth_headers("auth0|bob"))
+    assert list(db.users) == ["auth0|bob"]
 
 
-def test_settings_empty_then_saved_round_trip(client, auth_headers):
-    h = auth_headers()
-    first = client.get("/api/settings", headers=h).json()
-    assert first == {"settings": None, "updatedAt": None}
-
-    resp = client.put("/api/settings", headers=h, json={"settings": FRONTEND_SETTINGS})
-    assert resp.status_code == 200
-    assert resp.json()["settings"] == FRONTEND_SETTINGS  # stored and returned in the frontend's own shape
-    again = client.get("/api/settings", headers=h).json()
-    assert again["settings"] == FRONTEND_SETTINGS and again["updatedAt"]
+def test_users_me_requires_login(client):
+    assert client.get("/api/users/me").status_code == 401
 
 
-def test_settings_are_isolated_per_user(client, auth_headers, db):
-    client.put("/api/settings", headers=auth_headers("auth0|alice"), json={"settings": FRONTEND_SETTINGS})
-    assert client.get("/api/settings", headers=auth_headers("auth0|bob")).json()["settings"] is None
-    assert set(db.settings) == {"auth0|alice"}
+def test_users_me_503_without_database(settings, container, auth_headers):
+    from fastapi.testclient import TestClient
+    from app.main import create_app
 
-
-def test_settings_validation(client, auth_headers):
-    import copy
-
-    def variant(mutate):
-        body = copy.deepcopy(FRONTEND_SETTINGS)
-        mutate(body)
-        return {"settings": body}
-
-    bad_bodies = [
-        variant(lambda b: b.update(userId="auth0|victim")),  # unknown fields are rejected
-        variant(lambda b: b["rules"][0].update(kind="music")),
-        variant(lambda b: b["rules"].append(dict(b["rules"][0]))),  # duplicate rule id
-        variant(lambda b: b["rules"][0]["effects"].append("<script>")),
-        variant(lambda b: b["customStates"][0].update(color="blue")),
-        variant(lambda b: b["customStates"][0].update(id="urgent")),  # can't overwrite a system state
-        variant(lambda b: b["customStates"][0].update(duration=10**9)),
-        variant(lambda b: b["stateOrder"].append("ghost")),  # unknown state in the priority list
-        {"settings": {"rules": "nope"}},
-        {},
-    ]
-    h = auth_headers()
-    for body in bad_bodies:
-        resp = client.put("/api/settings", headers=h, json=body)
-        assert resp.status_code == 422, body
-        assert resp.json()["error"]["code"] == "validation_error"
+    container.database = None
+    with TestClient(create_app(settings, container)) as c:
+        assert c.get("/health").json()["database_configured"] is False
+        resp = c.get("/api/users/me", headers=auth_headers())
+        assert resp.status_code == 503 and resp.json()["error"]["code"] == "service_not_configured"
 
 
 def test_detect_sound_and_cooldown(client, auth_headers, classifier, db):
@@ -108,12 +73,6 @@ def test_detect_sound_and_cooldown(client, auth_headers, classifier, db):
     assert second["detected"] is True and second["is_new_event"] is False
     assert second["event_id"] == first["event_id"]
 
-    assert len(db.history) == 1  # history written once per event, not per chunk
-    assert db.history[0]["sound_type"] == "fire_alarm"
-
-    hist = client.get("/api/alert-history", headers=h).json()
-    assert [i["sound_type"] for i in hist["items"]] == ["fire_alarm"]
-
 
 def test_detect_below_threshold_is_unknown(client, auth_headers, classifier, db):
     classifier.set(doorbell=0.4)
@@ -121,7 +80,6 @@ def test_detect_below_threshold_is_unknown(client, auth_headers, classifier, db)
                        files={"audio": ("c.wav", wav_bytes(), "audio/wav")}).json()
     assert body["detected"] is False and body["sound_type"] == "unknown" and body["reason"] == "below_threshold"
     assert body["confidence"] == 0.4
-    assert db.history == []
 
 
 def test_detect_silence_skips_model(client, auth_headers, classifier):
@@ -157,25 +115,6 @@ def test_detect_rejects_bad_uploads(client, auth_headers, settings):
     assert missing.status_code == 422
 
 
-def test_history_pagination_and_delete(client, auth_headers, db):
-    h = auth_headers()
-    client.get("/api/users/me", headers=h)
-    base = datetime(2026, 11, 7, tzinfo=timezone.utc)
-    for i in range(3):
-        db.history.append({"id": f"id{i}", "user_id": "auth0|user-a", "sound_type": "doorbell",
-                           "confidence": 0.9, "detected_at": base + timedelta(minutes=i)})
-    db.history.append({"id": "other", "user_id": "auth0|other", "sound_type": "doorbell",
-                       "confidence": 0.9, "detected_at": base})
-
-    page1 = client.get("/api/alert-history?limit=2", headers=h).json()
-    assert [i["id"] for i in page1["items"]] == ["id2", "id1"] and page1["next_before"]
-    page2 = client.get("/api/alert-history", headers=h, params={"limit": 2, "before": page1["next_before"]}).json()
-    assert [i["id"] for i in page2["items"]] == ["id0"] and page2["next_before"] is None
-
-    assert client.delete("/api/alert-history", headers=h).status_code == 204
-    assert [r["user_id"] for r in db.history] == ["auth0|other"]  # other users untouched
-
-
 def test_rate_limit(settings, container, auth_headers):
     from fastapi.testclient import TestClient
     from app.main import create_app
@@ -183,9 +122,9 @@ def test_rate_limit(settings, container, auth_headers):
     settings.rate_limit_default_per_minute = 2
     with TestClient(create_app(settings, container)) as c:
         h = auth_headers()
-        assert c.get("/api/settings", headers=h).status_code == 200
-        assert c.get("/api/settings", headers=h).status_code == 200
-        resp = c.get("/api/settings", headers=h)
+        assert c.get("/api/users/me", headers=h).status_code == 200
+        assert c.get("/api/users/me", headers=h).status_code == 200
+        resp = c.get("/api/users/me", headers=h)
         assert resp.status_code == 429 and int(resp.headers["retry-after"]) >= 1
 
 
@@ -198,8 +137,9 @@ def test_sound_types_public(client):
 def test_openapi_docs(client):
     assert client.get("/docs").status_code == 200
     paths = client.get("/openapi.json").json()["paths"]
-    for p in ["/api/users/me", "/api/settings", "/api/detect-sound", "/api/alert-history"]:
+    for p in ["/api/users/me", "/api/detect-sound", "/api/sound-types"]:
         assert p in paths
+    assert "/api/settings" not in paths and "/api/alert-history" not in paths  # nothing else is stored
 
 
 # ------------------------------------------------- local dev: anonymous detection ----------
@@ -220,9 +160,8 @@ def test_anonymous_detection_in_development_without_auth0(settings, container, c
         assert c.get("/health").json()["anonymous_detection"] is True
         resp = c.post("/api/detect-sound", files={"audio": ("c.wav", wav_bytes(), "audio/wav")})
         assert resp.status_code == 200 and resp.json()["sound_type"] == "doorbell"
-        assert db.history == []  # anonymous detections are never stored
         # Everything else still needs a real login.
-        assert c.get("/api/settings").status_code == 401
+        assert c.get("/api/users/me").status_code == 401
 
 
 def test_anonymous_detection_refused_when_auth0_configured(settings, container):

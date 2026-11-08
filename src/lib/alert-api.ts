@@ -69,23 +69,17 @@ export function detectSound(wav: Blob, getToken?: TokenGetter, signal?: AbortSig
   )
 }
 
-// The frontend's settings document is stored as-is by the backend (GET/PUT /api/settings,
-// validated server-side). Requires a logged-in user.
-export type SettingsEnvelope<T> = { settings: T | null; updatedAt: string | null }
+// The backend's database records users only (Databricks users table). Calling this after login
+// creates the user on first login and updates last_login_at afterwards. Settings stay in the browser.
+export type UserRecord = {
+  id: string
+  email: string | null
+  username: string | null
+  created_at: string
+  last_login_at: string
+}
 
-export const getSettings = <T>(getToken: TokenGetter) =>
-  request<SettingsEnvelope<T>>('/api/settings', {}, getToken)
-
-export const putSettings = <T>(settings: T, getToken: TokenGetter) =>
-  request<SettingsEnvelope<T>>(
-    '/api/settings',
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ settings }),
-    },
-    getToken,
-  )
+export const recordLogin = (getToken: TokenGetter) => request<UserRecord>('/api/users/me', {}, getToken)
 
 // --------------------------------------------------------------- login (Auth0) ---------
 // Public identifiers only (no secrets). Set them in .env.local; audience must equal the backend's

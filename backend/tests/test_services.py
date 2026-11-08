@@ -1,69 +1,128 @@
-"""SupabaseDatabase and DatabricksClassifier against mocked HTTP (no real services needed)."""
+"""DatabricksDatabase and DatabricksClassifier against mocked HTTP (no real services needed)."""
 
 import asyncio
 import base64
 import json
-from datetime import datetime, timezone
 
 import httpx
 import numpy as np
 import pytest
 
 from app.core.errors import DatabaseError, InferenceError, ModelUnavailableError
-from app.services.database_service import SupabaseDatabase
+from app.services.database_service import DatabricksDatabase, quote_table_name
 from app.services.databricks_service import DatabricksClassifier
 from app.services.sound_classifier import FallbackClassifier
 from tests.conftest import ScriptedClassifier
 
+USER_COLUMNS = ["id", "email", "username", "created_at", "last_login_at"]
 
-def _db_with(handler) -> SupabaseDatabase:
-    db = SupabaseDatabase("https://proj.supabase.co", "sb_secret_abc")
-    db._client = httpx.AsyncClient(base_url="https://proj.supabase.co/rest/v1/", transport=httpx.MockTransport(handler),
-                                   headers=db._client.headers)
+
+def _sql_db_with(handler, **kw) -> DatabricksDatabase:
+    db = DatabricksDatabase("https://dbc-1.cloud.databricks.com/", "dapi-secret", "wh123", "main.alert.users", **kw)
+    db._client = httpx.AsyncClient(base_url="https://dbc-1.cloud.databricks.com",
+                                   transport=httpx.MockTransport(handler), headers=db._client.headers)
     return db
 
 
-def test_supabase_queries_always_scope_to_user():
-    seen = []
+def _succeeded(rows=None, columns=USER_COLUMNS):
+    return {"statement_id": "s1", "status": {"state": "SUCCEEDED"},
+            "manifest": {"schema": {"columns": [{"name": c} for c in columns]}},
+            "result": {"data_array": rows or []}}
+
+
+def test_record_login_sends_parameterized_sql_to_warehouse():
+    sent = []
 
     def handler(req: httpx.Request):
-        seen.append(req)
+        body = json.loads(req.content)
+        sent.append((req, body))
+        if body["statement"].startswith("SELECT"):
+            return httpx.Response(200, json=_succeeded(
+                [["auth0|a", None, "Ann", "2026-11-07T18:00:00.000Z", "2026-11-07T18:05:00.000Z"]]))
+        return httpx.Response(200, json=_succeeded(columns=[]))
+
+    db = _sql_db_with(handler)
+    row = asyncio.run(db.record_login("auth0|a", None, "Ann"))
+    assert row == {"id": "auth0|a", "email": None, "username": "Ann",
+                   "created_at": "2026-11-07T18:00:00.000Z", "last_login_at": "2026-11-07T18:05:00.000Z"}
+
+    create, merge, select = sent
+    req, _ = create
+    assert req.url.path == "/api/2.0/sql/statements/" and req.headers["authorization"] == "Bearer dapi-secret"
+    assert "CREATE TABLE IF NOT EXISTS `main`.`alert`.`users`" in create[1]["statement"]
+    body = merge[1]
+    assert body["warehouse_id"] == "wh123" and body["statement"].startswith("MERGE INTO `main`.`alert`.`users`")
+    assert "auth0|a" not in body["statement"]  # values are bound, never formatted into SQL
+    params = {p["name"]: p for p in body["parameters"]}
+    assert params["id"]["value"] == "auth0|a" and params["username"]["value"] == "Ann"
+    assert "value" not in params["email"]  # omitted value = SQL NULL
+    assert select[1]["parameters"] == [{"name": "id", "type": "STRING", "value": "auth0|a"}]
+
+    # The table is only created once per process.
+    sent.clear()
+    asyncio.run(db.get_user("auth0|a"))
+    assert len(sent) == 1 and sent[0][1]["statement"].startswith("SELECT")
+
+
+def test_statement_polls_while_warehouse_starts():
+    calls = []
+
+    def handler(req: httpx.Request):
+        calls.append(req.method)
         if req.method == "POST":
-            body = json.loads(req.content)
-            return httpx.Response(201, json=body if isinstance(body, list) else [body])  # PostgREST returns arrays
-        return httpx.Response(200, json=[])
+            return httpx.Response(200, json={"statement_id": "s9", "status": {"state": "PENDING"}})
+        if len(calls) < 3:
+            return httpx.Response(200, json={"statement_id": "s9", "status": {"state": "RUNNING"}})
+        return httpx.Response(200, json=_succeeded([]))
 
-    db = _db_with(handler)
-
-    async def run():
-        await db.get_settings("auth0|a")
-        await db.upsert_settings("auth0|a", {"simple": True, "rules": []})
-        await db.list_alert_history("auth0|a", 10, before=datetime(2026, 1, 1, tzinfo=timezone.utc))
-        await db.delete_alert_history("auth0|a")
-
-    asyncio.run(run())
-    get_settings, upsert, hist, delete = seen
-    assert get_settings.url.params["user_id"] == "eq.auth0|a"
-    assert json.loads(upsert.content)["user_id"] == "auth0|a"
-    assert upsert.url.params["on_conflict"] == "user_id"
-    assert "merge-duplicates" in upsert.headers["prefer"]
-    assert hist.url.params["detected_at"].startswith("lt.2026-01-01")
-    assert delete.method == "DELETE" and delete.url.params["user_id"] == "eq.auth0|a"
-    assert get_settings.headers["apikey"] == "sb_secret_abc"
-    assert "authorization" not in get_settings.headers  # sb_secret_ keys are not JWTs
+    db = _sql_db_with(handler, poll_interval=0)
+    db._table_ready = True
+    assert asyncio.run(db.get_user("auth0|nobody")) is None
+    assert calls == ["POST", "GET", "GET"]
 
 
-def test_supabase_errors_become_database_error():
-    db = _db_with(lambda req: httpx.Response(500, json={"message": "boom"}))
+def test_statement_timeout_cancels_and_raises():
+    paths = []
+
+    def handler(req: httpx.Request):
+        paths.append(req.url.path)
+        return httpx.Response(200, json={"statement_id": "s9", "status": {"state": "PENDING"}})
+
+    db = _sql_db_with(handler, timeout=0, poll_interval=0)
+    db._table_ready = True
     with pytest.raises(DatabaseError):
-        asyncio.run(db.get_profile("auth0|a"))
+        asyncio.run(db.get_user("auth0|a"))
+    assert paths[-1] == "/api/2.0/sql/statements/s9/cancel"
 
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(403, json={"message": "invalid token"}),
+    httpx.Response(200, json={"statement_id": "s1", "status": {"state": "FAILED", "error": {"message": "TABLE_OR_VIEW_NOT_FOUND"}}}),
+    httpx.Response(200, text="not json"),
+])
+def test_sql_errors_become_database_error(response):
+    db = _sql_db_with(lambda req: response)
+    with pytest.raises(DatabaseError):
+        asyncio.run(db.get_user("auth0|a"))
+
+
+def test_sql_connection_failure_becomes_database_error():
     def down(req):
         raise httpx.ConnectError("refused")
 
-    db = _db_with(down)
     with pytest.raises(DatabaseError):
-        asyncio.run(db.get_profile("auth0|a"))
+        asyncio.run(_sql_db_with(down).get_user("auth0|a"))
+
+
+@pytest.mark.parametrize("name", ["users", "alert.users", "main.alert.users", "Main_1.a_b.c9"])
+def test_table_name_accepts_identifiers(name):
+    assert quote_table_name(name).count("`") == 2 * len(name.split("."))
+
+
+@pytest.mark.parametrize("name", ["", "a.b.c.d", "main.alert.users; DROP TABLE x", "main.`x`", "1abc", "a..b"])
+def test_table_name_rejects_injection(name):
+    with pytest.raises(ValueError):
+        quote_table_name(name)
 
 
 def _databricks_with(handler) -> DatabricksClassifier:

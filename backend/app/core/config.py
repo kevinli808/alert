@@ -12,6 +12,8 @@ from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.database_service import quote_table_name
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -34,10 +36,11 @@ class Settings(BaseSettings):
     auth0_claim_namespace: str = "https://deaf-accessibility.app"
     jwt_leeway_seconds: int = Field(default=30, ge=0, le=300)
 
-    # --- Supabase ------------------------------------------------------------------
-    supabase_url: str = ""  # e.g. "https://abcd1234.supabase.co"
-    supabase_service_key: SecretStr = SecretStr("")  # service_role / sb_secret_ key. Server-side only.
-    database_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    # --- Users database (Databricks SQL) ------------------------------------------
+    # Uses DATABRICKS_HOST and DATABRICKS_TOKEN from the Databricks section below.
+    databricks_warehouse_id: str = ""  # SQL warehouse → Connection details → the id at the end of "HTTP path"
+    databricks_users_table: str = "workspace.alert.users"  # catalog.schema.table; the table is created on first use
+    database_timeout_seconds: float = Field(default=30.0, gt=0, le=120)  # covers a warehouse cold start
 
     # --- Audio input ---------------------------------------------------------------
     max_upload_bytes: int = Field(default=2_000_000, gt=0, le=20_000_000)
@@ -57,12 +60,12 @@ class Settings(BaseSettings):
     # Optional JSON object of per-category overrides, e.g. {"glass_breaking": 0.6}
     category_thresholds: str = ""
     detection_cooldown_seconds: float = Field(default=10.0, ge=0, le=600)
-    record_history: bool = True
 
-    # --- Databricks (optional) ----------------------------------------------------
+    # --- Databricks ----------------------------------------------------------------
+    # Host + token are shared by the users database and the (optional) model-serving provider.
     databricks_host: str = ""  # e.g. "https://adb-1234567890123456.7.azuredatabricks.net"
     databricks_token: SecretStr = SecretStr("")
-    databricks_endpoint_name: str = ""
+    databricks_endpoint_name: str = ""  # only for INFERENCE_PROVIDER=databricks
     databricks_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     databricks_fallback_to_local: bool = True
 
@@ -89,8 +92,12 @@ class Settings(BaseSettings):
         return self.allow_anonymous_detection and self.environment == "development" and not self.auth0_configured
 
     @property
-    def supabase_configured(self) -> bool:
-        return bool(self.supabase_url and self.supabase_service_key.get_secret_value())
+    def users_db_configured(self) -> bool:
+        return bool(
+            self.databricks_host
+            and self.databricks_warehouse_id
+            and self.databricks_token.get_secret_value()
+        )
 
     @property
     def databricks_configured(self) -> bool:
@@ -123,12 +130,13 @@ class Settings(BaseSettings):
         if self.min_audio_seconds >= self.max_audio_seconds:
             raise ValueError("MIN_AUDIO_SECONDS must be smaller than MAX_AUDIO_SECONDS")
         _ = self.category_threshold_map  # raises on invalid JSON
+        quote_table_name(self.databricks_users_table)  # raises on anything but catalog.schema.table
         if self.environment == "production":
             missing = []
             if not self.auth0_configured:
                 missing.append("AUTH0_DOMAIN/AUTH0_AUDIENCE")
-            if not self.supabase_configured:
-                missing.append("SUPABASE_URL/SUPABASE_SERVICE_KEY")
+            if not self.users_db_configured:
+                missing.append("DATABRICKS_HOST/DATABRICKS_TOKEN/DATABRICKS_WAREHOUSE_ID")
             if self.inference_provider == "databricks" and not self.databricks_configured:
                 missing.append("DATABRICKS_HOST/DATABRICKS_TOKEN/DATABRICKS_ENDPOINT_NAME")
             if any("*" in o for o in self.cors_origin_list):

@@ -11,13 +11,13 @@ React ──(Auth0 access token + 2 s WAV chunk)──▶ FastAPI
                                                  ├─ sound_classifier.py       YAMNet (local)  ─┐ replaceable
                                                  ├─ databricks_service.py     Model Serving  ─┘ provider
                                                  ├─ prediction_processor.py   threshold, priority, cooldown/events
-                                                 └─ database_service.py       Supabase (profiles, prefs, history)
+                                                 └─ database_service.py       Databricks SQL (users table only)
 ```
 
 ## Contents
 1. [Quick start](#1-quick-start)
 2. [Auth0 setup](#2-auth0-setup)
-3. [Supabase setup](#3-supabase-setup)
+3. [Databricks users database](#3-databricks-users-database)
 4. [Sound classification](#4-sound-classification-yamnet)
 5. [Databricks (optional)](#5-databricks-optional)
 6. [API reference](#6-api-reference)
@@ -39,14 +39,14 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\activate            # macOS/Linux: source .venv/bin/activate
 pip install -r requirements-dev.txt
-copy .env.example .env               # then fill in Auth0 + Supabase values
+copy .env.example .env               # then fill in Auth0 + Databricks values
 uvicorn app.main:app --reload
 ```
 
 - Swagger UI: http://localhost:8000/docs. Click **Authorize** and paste an Auth0 access token.
 - Health: http://localhost:8000/health. `model.status` goes from `loading` to `ready` in about 5 to 30 s.
   The first run downloads YAMNet (~15 MB).
-- With Auth0 or Supabase unconfigured, the server still starts. The affected endpoints return
+- With Auth0 or the Databricks users database unconfigured, the server still starts. The affected endpoints return
   `503 service_not_configured`. In `ENVIRONMENT=production` the server refuses to start instead.
 
 Optional: install **ffmpeg** to accept WebM/MP4 from `MediaRecorder`. WAV, FLAC, OGG and MP3 work
@@ -74,8 +74,7 @@ without it.
      const ns = "https://deaf-accessibility.app";   // = AUTH0_CLAIM_NAMESPACE
      api.accessToken.setCustomClaim(`${ns}/email`, event.user.email);
      api.accessToken.setCustomClaim(`${ns}/name`, event.user.name || event.user.nickname);
-     // Only needed if you enable Supabase third-party auth (section 3, optional):
-     api.accessToken.setCustomClaim("role", "authenticated");
+          api.accessToken.setCustomClaim("role", "authenticated");
    };
    ```
    Deploy it, then add it to the **Post Login** trigger flow.
@@ -85,32 +84,40 @@ The backend verifies tokens locally with the cached JWKS
 `aud`, `exp`/`iat` with 30 s leeway, and `sub`. Passwords and sessions are handled entirely by Auth0.
 Session management means the SPA SDK refreshes tokens and logout clears the Auth0 session.
 
-## 3. Supabase setup
+## 3. Databricks users database
 
-**What I need from you:** a Supabase project.
+The database records **users only**: one row per Auth0 account, written when the frontend calls
+`GET /api/users/me` after login. Alert settings stay in the browser, and detections are not stored.
 
-1. Open Dashboard → **SQL Editor**, paste [sql/schema.sql](sql/schema.sql) and run it. The script is
-   safe to re-run. It creates:
-   - `profiles` (id = Auth0 `sub`)
-   - `user_settings` (one JSON document per user: the frontend's sound rules, visual states and priority order)
-   - `alert_history` (indexed on `user_id, detected_at desc`)
-   - an `updated_at` trigger
-   - **RLS enabled on every table**, with nothing granted to `anon`
-2. Go to Project Settings → API Keys and copy the **Project URL** into `SUPABASE_URL`. Copy the
-   **secret** (`sb_secret_…`) or legacy **service_role** key into `SUPABASE_SERVICE_KEY`.
-   This key bypasses RLS, so it stays on the server only.
+| Column | Meaning |
+|---|---|
+| `id` | Auth0 user id (the access token's `sub`) |
+| `email`, `username` | from the token claims (section 2, step 4) or Auth0 `/userinfo` |
+| `created_at` | first login |
+| `last_login_at` | most recent login |
 
-**How access control works.** React never talks to Supabase directly. FastAPI verifies the Auth0
-token and runs every query filtered by that token's `sub`. The user ID is never taken from the
-request body; the tests check this. RLS is defence in depth: the public anon key can read nothing.
+**What I need from you:** a Databricks workspace with a SQL warehouse (the free edition works).
 
-*Optional, only if you later want React to query Supabase directly:* go to Authentication →
-Sign In / Providers → **Third-party auth → Auth0** and enter your tenant. Keep the `role` claim
-from the Action in section 2. The policies in `schema.sql` (`user_id = auth.jwt()->>'sub'`) then
-limit each user to their own rows.
+1. **SQL warehouse.** SQL Warehouses → pick one (or *Create* a small serverless one) → **Connection
+   details**. Copy the **Server hostname** into `DATABRICKS_HOST` as `https://<hostname>`, and the id
+   at the end of **HTTP path** (`/sql/1.0/warehouses/<id>`) into `DATABRICKS_WAREHOUSE_ID`.
+2. **Token.** Your avatar → Settings → Developer → Access tokens → *Generate new token*. Put it in
+   `DATABRICKS_TOKEN`. It stays in `backend/.env` only, never in React.
+3. **Table.** Open SQL Editor, choose the warehouse, and run [sql/databricks_users.sql](sql/databricks_users.sql).
+   It creates the `workspace.alert` schema and the `users` table. The backend also creates the table on
+   first use, so only the schema has to exist. For a different location set `DATABRICKS_USERS_TABLE`
+   (`catalog.schema.table`).
+4. Restart the backend. `/health` shows `"database_configured": true`.
 
-No audio is ever stored. History stores only the sound type, confidence and time, **once per
-event** rather than per chunk. Users can delete it with `DELETE /api/alert-history`.
+**How access control works.** React never talks to Databricks. FastAPI verifies the Auth0 token and
+writes the row keyed by that token's `sub`; the user id is never taken from the request. All values
+are sent as SQL statement parameters, and the table name is validated as an identifier at startup.
+
+A stopped serverless warehouse takes a few seconds to wake up, and a classic one can take minutes.
+Requests wait up to `DATABASE_TIMEOUT_SECONDS` (default 30) and then return `503 database_unavailable`;
+login itself still works, and the row is written on the next login.
+
+No audio is ever stored.
 
 ## 4. Sound classification (YAMNet)
 
@@ -206,12 +213,8 @@ at `/docs`.
 |---|---|---|---|
 | GET | `/health` | Model, auth and DB status | public |
 | GET | `/api/sound-types` | Detectable categories and thresholds | public |
-| GET | `/api/users/me` | Current profile (created on first call) | |
-| GET | `/api/settings` | The user's saved alert settings | `settings: null` until first save |
-| PUT | `/api/settings` | Replace the user's alert settings | body `{"settings":{simple,rules,customStates,stateOrder,introComplete}}` (the frontend's model; unknown fields rejected) |
+| GET | `/api/users/me` | Record the logged-in user (row created on first call, `last_login_at` updated after) | called by the frontend after login |
 | POST | `/api/detect-sound` | Classify one chunk | multipart field `audio`; 0.5–10 s; ≤2 MB |
-| GET | `/api/alert-history` | Detected events, newest first | `?limit=50&before=<iso>` |
-| DELETE | `/api/alert-history` | Delete the user's history | 204 |
 
 Status codes:
 - `401` missing or invalid token
@@ -230,42 +233,33 @@ API=http://localhost:8000
 
 curl $API/api/users/me -H "Authorization: Bearer $TOKEN"
 
-curl $API/api/settings -H "Authorization: Bearer $TOKEN"
-
-curl -X PUT $API/api/settings -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"settings":{"simple":false,"rules":[{"id":"doorbell","label":"Doorbell","kind":"sound","enabled":true,"effects":["warning"]}],"customStates":[],"stateOrder":["urgent","warning","default"],"introComplete":true}}'
-
 curl -X POST $API/api/detect-sound -H "Authorization: Bearer $TOKEN" -F "audio=@doorbell.wav;type=audio/wav"
-
-curl "$API/api/alert-history?limit=20" -H "Authorization: Bearer $TOKEN"
 ```
 
 ## 7. Testing
 
 ```bash
-pytest                              # 48 tests, no network or credentials needed (~6 s)
+pytest                              # 65 tests, no network or credentials needed (~6 s)
 RUN_MODEL_TESTS=1 pytest -s tests/test_yamnet_integration.py   # real YAMNet + latency (PowerShell: $env:RUN_MODEL_TESTS=1)
 ```
 
 The tests cover:
 - JWT validation: expiry, audience, issuer, unknown key, forged signature, HS256 algorithm confusion
 - per-user data isolation, and rejection of a `user_id` in the request body
-- settings validation (field allowlist, ids, colours, state references)
-- token-less detection only in local development without Auth0, never storing history
+- token-less detection only in local development without Auth0, never touching the database
 - audio decoding: stereo/44.1 kHz → mono/16 kHz, corrupt, empty, too long/short, silence
 - threshold, priority and cooldown logic, and invalid model output
-- history pagination and deletion
+- user recording keyed by the token, never by the request
 - the rate limiter and CORS
-- the Supabase and Databricks HTTP contracts (mocked), timeouts, and the fallback provider
+- the Databricks SQL and Model Serving HTTP contracts (mocked), table-name validation, timeouts, and the fallback provider
 
 Test doubles live only in `tests/`.
 
 **End-to-end with real services** (Phase 6). Once your `.env` is filled in:
 1. log in through React
-2. confirm `GET /api/users/me` creates a row in `profiles`
-3. play a doorbell or alarm sound near the mic
-4. check that a row appears in `alert_history` once per event
-5. sign in as a second user and confirm you cannot see the first user's data
+2. confirm a row appears: `SELECT * FROM workspace.alert.users ORDER BY last_login_at DESC`
+3. reload the page and confirm `last_login_at` moves forward on the same row
+4. sign in as a second user and confirm a second row appears
 
 ## 8. Deployment
 
@@ -286,7 +280,7 @@ for judging. If you do deploy:
 
 ## 9. Security notes
 
-- The server holds every secret: the Supabase secret key, the Databricks token, and any Auth0
+- The server holds every secret: the Databricks token, and any Auth0
   Management credentials, which this backend does not need at all.
 - The logs never contain tokens, audio bytes, or secret values (settings use `SecretStr`).
 - Uploads are capped by both `Content-Length` and the bytes actually read. They are decoded in

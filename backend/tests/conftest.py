@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import io
 import time
-import uuid
+
 from datetime import datetime, timezone
 from typing import Any
 
@@ -83,41 +83,21 @@ def make_token(rsa_key):
 # ---------------------------------------------------------------- database ---------------
 class InMemoryDatabase(Database):
     def __init__(self) -> None:
-        self.profiles: dict[str, dict[str, Any]] = {}
-        self.settings: dict[str, dict[str, Any]] = {}
-        self.history: list[dict[str, Any]] = []
+        self.users: dict[str, dict[str, Any]] = {}
 
-    async def get_profile(self, user_id):
-        return self.profiles.get(user_id)
-
-    async def create_profile_if_missing(self, user_id, email, username):
-        return self.profiles.setdefault(
-            user_id, {"id": user_id, "email": email, "username": username, "created_at": datetime.now(timezone.utc)}
-        )
-
-    async def get_settings(self, user_id):
-        row = self.settings.get(user_id)
+    async def get_user(self, user_id):
+        row = self.users.get(user_id)
         return dict(row) if row else None
 
-    async def upsert_settings(self, user_id, settings):
-        assert user_id in self.profiles, "FK violation: profile must exist"
-        self.settings[user_id] = {"settings": settings, "updated_at": datetime.now(timezone.utc)}
-        return dict(self.settings[user_id])
-
-    async def insert_alert_history(self, user_id, sound_type, confidence, detected_at):
-        assert user_id in self.profiles, "FK violation: profile must exist"
-        self.history.append(
-            {"id": str(uuid.uuid4()), "user_id": user_id, "sound_type": sound_type,
-             "confidence": confidence, "detected_at": detected_at}
-        )
-
-    async def list_alert_history(self, user_id, limit, before=None):
-        rows = [h for h in self.history if h["user_id"] == user_id and (before is None or h["detected_at"] < before)]
-        rows.sort(key=lambda h: h["detected_at"], reverse=True)
-        return [{k: v for k, v in r.items() if k != "user_id"} for r in rows[:limit]]
-
-    async def delete_alert_history(self, user_id):
-        self.history = [h for h in self.history if h["user_id"] != user_id]
+    async def record_login(self, user_id, email, username):
+        now = datetime.now(timezone.utc)
+        row = self.users.get(user_id)
+        if row is None:
+            row = self.users[user_id] = {"id": user_id, "email": email, "username": username,
+                                         "created_at": now, "last_login_at": now}
+        else:
+            row.update(email=email or row["email"], username=username or row["username"], last_login_at=now)
+        return dict(row)
 
 
 # ---------------------------------------------------------------- classifier -------------

@@ -9,7 +9,7 @@ from app.core.config import Settings
 from app.core.security import RateLimiter
 from app.services.audio_processor import AudioProcessor
 from app.services.auth_service import Auth0TokenVerifier
-from app.services.database_service import Database, SupabaseDatabase
+from app.services.database_service import Database, DatabricksDatabase
 from app.services.databricks_service import DatabricksClassifier
 from app.services.detection_service import DetectionService
 from app.services.prediction_processor import PredictionProcessor
@@ -61,14 +61,16 @@ def build_services(settings: Settings) -> ServiceContainer:
         logger.warning("Auth0 is not configured: protected endpoints will return 503")
 
     database = None
-    if settings.supabase_configured:
-        database = SupabaseDatabase(
-            settings.supabase_url,
-            settings.supabase_service_key.get_secret_value(),
+    if settings.users_db_configured:
+        database = DatabricksDatabase(
+            settings.databricks_host,
+            settings.databricks_token.get_secret_value(),
+            settings.databricks_warehouse_id,
+            settings.databricks_users_table,
             settings.database_timeout_seconds,
         )
     else:
-        logger.warning("Supabase is not configured: database endpoints will return 503")
+        logger.warning("Databricks users database is not configured: /api/users/me will return 503")
 
     detection = DetectionService(
         AudioProcessor(

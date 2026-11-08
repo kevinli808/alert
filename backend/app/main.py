@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import detection, history, settings as settings_api, users
+from app.api import detection, users
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.security import install_http_middleware
@@ -55,7 +55,7 @@ def create_app(settings: Settings | None = None, services: ServiceContainer | No
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
         allow_credentials=False,  # bearer tokens, not cookies
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
         expose_headers=["X-Process-Time-Ms", "Retry-After"],
         max_age=600,
@@ -64,9 +64,7 @@ def create_app(settings: Settings | None = None, services: ServiceContainer | No
     register_exception_handlers(app)
 
     app.include_router(users.router)
-    app.include_router(settings_api.router)
     app.include_router(detection.router)
-    app.include_router(history.router)
 
     @app.get("/health", tags=["health"], summary="Liveness and readiness of dependencies")
     def health(request: Request) -> dict:
@@ -78,6 +76,7 @@ def create_app(settings: Settings | None = None, services: ServiceContainer | No
             "auth_configured": c.token_verifier is not None,
             # True when the frontend may call /api/detect-sound without logging in (local dev only).
             "anonymous_detection": c.settings.anonymous_detection_enabled,
+            # True when logins are recorded in the Databricks users table.
             "database_configured": c.database is not None,
         }
 
