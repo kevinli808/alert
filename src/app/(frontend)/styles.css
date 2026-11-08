@@ -1070,6 +1070,8 @@
   min-height: 0;
   padding: 0 13px 13px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 .index-list button {
   width: 100%;
@@ -1124,6 +1126,8 @@
   min-height: 0;
   padding: 16px 21px 8px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
 }
 .simple-effects legend {
   margin-bottom: 8px;
