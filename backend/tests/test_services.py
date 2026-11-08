@@ -29,27 +29,28 @@ def test_supabase_queries_always_scope_to_user():
     def handler(req: httpx.Request):
         seen.append(req)
         if req.method == "POST":
-            return httpx.Response(201, json=json.loads(req.content))
+            body = json.loads(req.content)
+            return httpx.Response(201, json=body if isinstance(body, list) else [body])  # PostgREST returns arrays
         return httpx.Response(200, json=[])
 
     db = _db_with(handler)
 
     async def run():
-        await db.list_preferences("auth0|a")
-        await db.upsert_preferences("auth0|a", [{"sound_type": "doorbell", "color": "#000000", "enabled": True, "flash_speed": 1}])
+        await db.get_settings("auth0|a")
+        await db.upsert_settings("auth0|a", {"simple": True, "rules": []})
         await db.list_alert_history("auth0|a", 10, before=datetime(2026, 1, 1, tzinfo=timezone.utc))
         await db.delete_alert_history("auth0|a")
 
     asyncio.run(run())
-    get_prefs, upsert, hist, delete = seen
-    assert get_prefs.url.params["user_id"] == "eq.auth0|a"
-    assert json.loads(upsert.content)[0]["user_id"] == "auth0|a"
-    assert upsert.url.params["on_conflict"] == "user_id,sound_type"
+    get_settings, upsert, hist, delete = seen
+    assert get_settings.url.params["user_id"] == "eq.auth0|a"
+    assert json.loads(upsert.content)["user_id"] == "auth0|a"
+    assert upsert.url.params["on_conflict"] == "user_id"
     assert "merge-duplicates" in upsert.headers["prefer"]
     assert hist.url.params["detected_at"].startswith("lt.2026-01-01")
     assert delete.method == "DELETE" and delete.url.params["user_id"] == "eq.auth0|a"
-    assert get_prefs.headers["apikey"] == "sb_secret_abc"
-    assert "authorization" not in get_prefs.headers  # sb_secret_ keys are not JWTs
+    assert get_settings.headers["apikey"] == "sb_secret_abc"
+    assert "authorization" not in get_settings.headers  # sb_secret_ keys are not JWTs
 
 
 def test_supabase_errors_become_database_error():

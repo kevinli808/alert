@@ -13,6 +13,7 @@
     "payload": "NODE_OPTIONS=--no-deprecation payload"
   },
   "dependencies": {
+    "@auth0/auth0-react": "2.30.0",
     "@payloadcms/figma": "1.0.0-beta.1",
     "@payloadcms/next": "4.0.0-beta.6",
     "@payloadcms/plugin-cloud-storage": "4.0.0-beta.6",

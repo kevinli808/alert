@@ -3,14 +3,35 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type CSSProperties,
   type ReactNode,
 } from 'react'
+import { Auth0Provider, useAuth0 } from '@auth0/auth0-react'
+import {
+  AUTH0_CONFIG,
+  AUTH0_ENABLED,
+  ApiError,
+  BACKEND_SOUND_TO_RULE,
+  LIVE_RULE_IDS,
+  detectSound,
+  encodeWav,
+  getAccessToken,
+  getHealth,
+  getSettings,
+  putSettings,
+  setAccessTokenGetter,
+  startChunkCapture,
+  type DetectionResult,
+} from '@/lib/alert-api'
+
+const CHUNK_SECONDS = 2
 
 type ListeningState = 'paused' | 'listening' | 'unavailable'
+type BackendStatus = 'checking' | 'ready' | 'loading' | 'offline' | 'login-required' | 'error'
 type View = 'home' | 'configure'
 type DialogName = 'help' | 'account' | 'custom-state' | null
 type Priority = 0 | 1 | 2
@@ -44,6 +65,8 @@ type Detection = {
   label: string
   expiresAt: number
   critical: boolean
+  live: boolean
+  confidence?: number
 }
 type StoredSettings = {
   simple: boolean
@@ -119,6 +142,29 @@ const DEFAULT_RULES: SoundRule[] = [
     effects: ['warning', 'vibration'],
   },
   {
+    id: 'fire-alarm',
+    label: 'Fire alarm',
+    kind: 'sound',
+    enabled: true,
+    effects: ['urgent', 'vibration'],
+  },
+  {
+    id: 'alarm',
+    label: 'Alarm / buzzer',
+    kind: 'sound',
+    enabled: true,
+    effects: ['urgent', 'vibration'],
+  },
+  { id: 'car-alarm', label: 'Car alarm', kind: 'sound', enabled: true, effects: ['warning'] },
+  {
+    id: 'door-knock',
+    label: 'Door knock',
+    kind: 'sound',
+    enabled: true,
+    effects: ['warning', 'vibration'],
+  },
+  { id: 'alarm-clock', label: 'Alarm clock', kind: 'sound', enabled: true, effects: ['warning'] },
+  {
     id: 'phrase-help',
     label: 'Help',
     kind: 'phrase',
@@ -150,25 +196,51 @@ const FUTURE_EFFECTS = [
 ]
 const FUTURE_EFFECT_IDS = new Set(FUTURE_EFFECTS.map((effect) => effect.id))
 
+const API_STATUS_LABEL: Record<BackendStatus, string> = {
+  checking: 'CONNECTING TO DETECTOR…',
+  ready: 'LIVE DETECTION READY',
+  loading: 'DETECTION MODEL STARTING…',
+  offline: 'DETECTOR OFFLINE · DEMO ONLY',
+  'login-required': 'LOG IN FOR LIVE DETECTION',
+  error: 'DETECTOR ERROR · DEMO ONLY',
+}
+const API_STATUS_HINT: Record<BackendStatus, string> = {
+  checking: 'connecting to the detection server',
+  ready: 'connected',
+  loading: 'the sound model is still loading',
+  offline: 'detection server not reachable, so only simulated sounds work',
+  'login-required': 'the detection server requires a login',
+  error: 'the detection server reported an error',
+}
+
+const DEFAULT_SETTINGS: StoredSettings = {
+  simple: false,
+  rules: DEFAULT_RULES,
+  customStates: [],
+  stateOrder: SYSTEM_STATE_ORDER,
+  introComplete: false,
+}
+
 function loadSettings(): StoredSettings {
-  if (typeof window === 'undefined') {
-    return {
-      simple: false,
-      rules: DEFAULT_RULES,
-      customStates: [],
-      stateOrder: SYSTEM_STATE_ORDER,
-      introComplete: false,
-    }
-  }
+  if (typeof window === 'undefined') return DEFAULT_SETTINGS
   try {
-    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') as Partial<StoredSettings>
+    return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'))
+  } catch {
+    return DEFAULT_SETTINGS
+  }
+}
+
+/** Repairs settings from any source (this browser or the backend) into a consistent shape. */
+function normalizeSettings(saved: Partial<StoredSettings>): StoredSettings {
+  try {
     const customStates = (saved.customStates ?? []).map((state, index) => {
-      const legacyState = state as VisualState & { label?: string }
+      // Drop the legacy `label` key so the backend (which allowlists fields) accepts the state.
+      const { label: legacyLabel, ...current } = state as VisualState & { label?: string }
       return {
-        ...state,
+        ...current,
         name:
           (typeof state.name === 'string' && state.name.trim()) ||
-          (typeof legacyState.label === 'string' && legacyState.label.trim()) ||
+          (typeof legacyLabel === 'string' && legacyLabel.trim()) ||
           `Custom state ${index + 1}`,
       }
     })
@@ -183,7 +255,12 @@ function loadSettings(): StoredSettings {
       'default',
     ]
     const visualStateIds = new Set(allStateIds)
-    const rules = (saved.rules?.length ? saved.rules : DEFAULT_RULES).map((rule) => {
+    const savedRules = saved.rules?.length ? saved.rules : DEFAULT_RULES
+    // Settings saved before a sound was added (e.g. new backend categories) still get that sound.
+    const missingSounds = DEFAULT_RULES.filter(
+      (rule) => rule.kind === 'sound' && !savedRules.some((savedRule) => savedRule.id === rule.id),
+    )
+    const rules = [...savedRules, ...missingSounds].map((rule) => {
       const assignedStates = rule.effects.filter((effect) => visualStateIds.has(effect))
       const assignedState =
         stateOrder.find((stateId) => assignedStates.includes(stateId)) ?? 'default'
@@ -200,13 +277,7 @@ function loadSettings(): StoredSettings {
       introComplete: saved.introComplete ?? false,
     }
   } catch {
-    return {
-      simple: false,
-      rules: DEFAULT_RULES,
-      customStates: [],
-      stateOrder: SYSTEM_STATE_ORDER,
-      introComplete: false,
-    }
+    return DEFAULT_SETTINGS
   }
 }
 
@@ -655,7 +726,9 @@ function NodeEditor(props: EditorProps) {
                 <small>
                   {rule.kind === 'phrase'
                     ? 'Recognized phrase · integration required'
-                    : 'Environmental sound'}
+                    : LIVE_RULE_IDS.has(rule.id)
+                      ? 'Environmental sound · live detection'
+                      : 'Environmental sound · simulation only'}
                 </small>
               </span>
               <i className={rule.enabled ? 'enabled' : ''} />
@@ -760,6 +833,7 @@ function NodeEditor(props: EditorProps) {
             Outgoing spoken response
             <input
               value={selected.ttsResponse ?? ''}
+              maxLength={300}
               onChange={(event) =>
                 props.updateRule(selected.id, { ttsResponse: event.target.value })
               }
@@ -903,6 +977,7 @@ function SimpleEditor(props: EditorProps) {
             Outgoing text-to-speech response
             <input
               value={selected.ttsResponse ?? ''}
+              maxLength={300}
               onChange={(event) =>
                 props.updateRule(selected.id, { ttsResponse: event.target.value })
               }
@@ -1072,7 +1147,15 @@ function StatePriorityPanel({
   )
 }
 
-export default function AlertApp() {
+/** Real login (Auth0). null = Auth0 not configured, so the local preview account is used. */
+type RealAuth = {
+  loading: boolean
+  user: { id: string; name: string; email: string } | null
+  login: (mode: 'login' | 'create' | 'google') => void
+  logout: () => void
+}
+
+function AlertApp({ auth }: { auth: RealAuth | null }) {
   const initial = useMemo(loadSettings, [])
   const [view, setView] = useState<View>('home')
   const [simple, setSimple] = useState(initial.simple)
@@ -1082,7 +1165,9 @@ export default function AlertApp() {
   const [introComplete, setIntroComplete] = useState(initial.introComplete)
   const [dialog, setDialog] = useState<DialogName>(null)
   const [introHelp, setIntroHelp] = useState(false)
-  const [account, setAccount] = useState<{ name: string; email: string } | null>(null)
+  const [localAccount, setLocalAccount] = useState<{ name: string; email: string } | null>(null)
+  const account = auth ? auth.user : localAccount
+  const accountKey = auth ? (auth.user?.id ?? null) : (localAccount?.email ?? null)
   const [accountMode, setAccountMode] = useState<'login' | 'create'>('login')
   const [listening, setListening] = useState<ListeningState>('paused')
   const [audioLevel, setAudioLevel] = useState(0)
@@ -1108,6 +1193,74 @@ export default function AlertApp() {
   const simpleRef = useRef(simple)
   const activeRef = useRef<ActiveAlert | null>(null)
   const pendingRef = useRef<AlertRequest[]>([])
+  const [backendStatus, setBackendStatus] = useState<BackendStatus>('checking')
+  const triggerRuleRef = useRef<(id: string, live?: { confidence: number }) => void>(() => {})
+  const detectBusyRef = useRef(false)
+  const detectPausedUntilRef = useRef(0)
+  const micSessionRef = useRef(0)
+
+  const checkBackend = useCallback(async () => {
+    try {
+      const health = await getHealth()
+      // With Auth0 on the server, detection needs a logged-in user's access token.
+      const allowed = health.anonymous_detection || (health.auth_configured && (await getAccessToken()))
+      if (allowed) {
+        const model = health.model.status
+        setBackendStatus(model === 'ready' ? 'ready' : model === 'failed' ? 'error' : 'loading')
+      } else {
+        setBackendStatus('login-required')
+      }
+    } catch {
+      setBackendStatus('offline')
+    }
+  }, [])
+  useEffect(() => {
+    void checkBackend()
+  }, [checkBackend, accountKey])
+  useEffect(() => {
+    // Keep checking while the model warms up or the server is down, so the status recovers by itself.
+    if (backendStatus !== 'loading' && backendStatus !== 'offline') return
+    const interval = window.setInterval(() => void checkBackend(), 4000)
+    return () => window.clearInterval(interval)
+  }, [backendStatus, checkBackend])
+
+  const handleDetection = useCallback((result: DetectionResult) => {
+    setBackendStatus('ready')
+    // Only the first chunk of an event triggers an alert; later chunks of the same sound repeat it.
+    if (!result.detected || !result.is_new_event || !result.sound_type) return
+    const ruleId = BACKEND_SOUND_TO_RULE[result.sound_type]
+    if (ruleId) triggerRuleRef.current(ruleId, { confidence: result.confidence })
+  }, [])
+
+  const sendChunk = useCallback(
+    async (samples: Float32Array, sampleRate: number, session: number) => {
+      // Drop chunks rather than queue them: a late alert is worse than a skipped chunk.
+      if (detectBusyRef.current || Date.now() < detectPausedUntilRef.current) return
+      detectBusyRef.current = true
+      try {
+        const result = await detectSound(encodeWav(samples, sampleRate), getAccessToken)
+        if (session === micSessionRef.current) handleDetection(result)
+      } catch (error) {
+        if (!(error instanceof ApiError)) {
+          setBackendStatus('offline')
+          detectPausedUntilRef.current = Date.now() + 4000
+        } else if (error.status === 401) {
+          setBackendStatus('login-required')
+          detectPausedUntilRef.current = Date.now() + 10000
+        } else if (error.code === 'model_unavailable') {
+          setBackendStatus('loading')
+        } else if (error.status === 429) {
+          detectPausedUntilRef.current = Date.now() + (error.retryAfter ?? 5) * 1000
+        } else if (error.status >= 500) {
+          setBackendStatus('error')
+        }
+        // 422 invalid_audio (e.g. a glitchy chunk) is ignored; the next chunk is tried normally.
+      } finally {
+        detectBusyRef.current = false
+      }
+    },
+    [handleDetection],
+  )
 
   const states = useMemo(() => {
     const available = [...SYSTEM_STATES, ...customStates]
@@ -1143,38 +1296,84 @@ export default function AlertApp() {
     pendingRef.current = pendingAlerts
   }, [pendingAlerts])
   useEffect(() => {
+    if (auth) return // real login: Auth0 owns the account
     try {
       const saved = JSON.parse(localStorage.getItem(ACCOUNT_KEY) || 'null') as {
         name: string
         email: string
       } | null
-      setAccount(saved)
+      setLocalAccount(saved)
     } catch {
       /* local account preview remains signed out */
     }
   }, [])
 
+  const settings = useMemo<StoredSettings>(
+    () => ({ simple, rules, customStates, stateOrder, introComplete }),
+    [customStates, introComplete, rules, simple, stateOrder],
+  )
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
+  // Backend sync is on only for a logged-in user. lastSyncedRef avoids re-uploading what we just got.
+  const remoteSyncRef = useRef(false)
+  const lastSyncedRef = useRef('')
+
+  const applySettings = useCallback((next: StoredSettings) => {
+    setSimple(next.simple)
+    setRules(next.rules)
+    setCustomStates(next.customStates)
+    setStateOrder(next.stateOrder)
+    setIntroComplete(next.introComplete)
+    setSelectedId((id) => (next.rules.some((rule) => rule.id === id) ? id : (next.rules[0]?.id ?? '')))
+  }, [])
+
+  useEffect(() => {
+    // On login: the account's saved settings win; a brand-new account starts from this browser's.
+    remoteSyncRef.current = false
+    if (!accountKey) return
+    let cancelled = false
+    void (async () => {
+      try {
+        if (!(await getAccessToken())) return // no real login: settings stay in this browser
+        // Without a database the server can't store settings; keep them in this browser.
+        if (!(await getHealth()).database_configured) return
+        const remote = await getSettings<StoredSettings>(getAccessToken)
+        if (cancelled) return
+        if (remote.settings) {
+          const next = normalizeSettings(remote.settings)
+          lastSyncedRef.current = JSON.stringify(next)
+          applySettings(next)
+        } else {
+          await putSettings(settingsRef.current, getAccessToken)
+          lastSyncedRef.current = JSON.stringify(settingsRef.current)
+        }
+        if (!cancelled) remoteSyncRef.current = true
+      } catch {
+        if (!cancelled) setSaveStatus('error')
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [accountKey, applySettings])
+
   useEffect(() => {
     setSaveStatus('saving')
-    const timeout = window.setTimeout(() => {
+    const timeout = window.setTimeout(async () => {
       try {
-        localStorage.setItem(
-          STORAGE_KEY,
-          JSON.stringify({
-            simple,
-            rules,
-            customStates,
-            stateOrder,
-            introComplete,
-          } satisfies StoredSettings),
-        )
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
+        const json = JSON.stringify(settings)
+        if (remoteSyncRef.current && json !== lastSyncedRef.current) {
+          await putSettings(settings, getAccessToken)
+          lastSyncedRef.current = json
+        }
         setSaveStatus('saved')
       } catch {
         setSaveStatus('error')
       }
-    }, 350)
+    }, 600)
     return () => window.clearTimeout(timeout)
-  }, [customStates, introComplete, rules, simple, stateOrder])
+  }, [settings])
 
   const stateDuration = useCallback(
     (stateId: string) => {
@@ -1300,6 +1499,7 @@ export default function AlertApp() {
   }
 
   const stopMicrophone = useCallback(() => {
+    micSessionRef.current += 1 // ignore results of requests still in flight
     const audio = audioRef.current
     if (audio) {
       cancelAnimationFrame(audio.frame)
@@ -1332,10 +1532,17 @@ export default function AlertApp() {
       const analyser = context.createAnalyser()
       analyser.fftSize = 256
       analyser.smoothingTimeConstant = 0.82
-      context.createMediaStreamSource(stream).connect(analyser)
+      const source = context.createMediaStreamSource(stream)
+      source.connect(analyser)
       const data = new Uint8Array(analyser.fftSize)
       const audio = { context, stream, frame: 0 }
       audioRef.current = audio
+      const session = ++micSessionRef.current
+      // Live detection: stream 2 s chunks to the backend. If capture fails, the waveform still works.
+      void startChunkCapture(context, source, CHUNK_SECONDS, (samples) => {
+        void sendChunk(samples, context.sampleRate, session)
+      }).catch(() => setBackendStatus('error'))
+      void checkBackend()
       const sample = () => {
         analyser.getByteTimeDomainData(data)
         waveformSamplesRef.current = data.slice()
@@ -1359,7 +1566,7 @@ export default function AlertApp() {
   useEffect(() => stopMicrophone, [stopMicrophone])
 
   const triggerRule = useCallback(
-    (id: string) => {
+    (id: string, live?: { confidence: number }) => {
       const rule = rules.find((item) => item.id === id)
       if (!rule || !rule.enabled) return
       setDetections((items) => {
@@ -1369,7 +1576,14 @@ export default function AlertApp() {
         )
         return [
           ...next,
-          { id, label: rule.label, critical: urgent, expiresAt: Date.now() + 6500 },
+          {
+            id,
+            label: rule.label,
+            critical: urgent,
+            expiresAt: Date.now() + 6500,
+            live: Boolean(live),
+            confidence: live?.confidence,
+          },
         ].slice(-6)
       })
       const visualEffect = rule.effects.find((effect) =>
@@ -1384,6 +1598,10 @@ export default function AlertApp() {
     },
     [enqueueAlert, rules, statePriority, states],
   )
+  useEffect(() => {
+    // The audio callback lives for the whole mic session; the ref gives it the latest rules/states.
+    triggerRuleRef.current = triggerRule
+  }, [triggerRule])
 
   const addPhrase = () => {
     const label = phraseDraft.trim()
@@ -1497,7 +1715,7 @@ export default function AlertApp() {
     const name = String(form.get('name') || email.split('@')[0])
     const next = { name, email }
     localStorage.setItem(ACCOUNT_KEY, JSON.stringify(next))
-    setAccount(next)
+    setLocalAccount(next)
     setDialog(null)
     if (accountMode === 'create' && !introComplete) {
       setIntroHelp(true)
@@ -1630,6 +1848,13 @@ export default function AlertApp() {
                     : 'Detection paused'}
               </p>
             </div>
+            {backendStatus !== 'ready' && (
+              <p className="integration-note">
+                {API_STATUS_HINT[backendStatus].charAt(0).toUpperCase() +
+                  API_STATUS_HINT[backendStatus].slice(1)}
+                .
+              </p>
+            )}
             {listening !== 'listening' && (
               <button className="simple-start" type="button" onClick={() => void startMicrophone()}>
                 Start listening
@@ -1670,7 +1895,9 @@ export default function AlertApp() {
                     ? 'MICROPHONE UNAVAILABLE'
                     : 'PAUSED'}
               </span>
-              <span className="demo-status">DETECTION DEMO READY</span>
+              <span className="demo-status" title={`Backend: ${API_STATUS_HINT[backendStatus]}`}>
+                {API_STATUS_LABEL[backendStatus]}
+              </span>
             </div>
             <div className="waveform-wrap">
               <Waveform
@@ -1733,7 +1960,11 @@ export default function AlertApp() {
                         className={`${detection.critical ? 'critical' : ''} ${detection.expiresAt - clock < 1400 ? 'expiring' : ''}`}
                       >
                         <span>{detection.label}</span>
-                        <small>DEMO</small>
+                        <small>
+                          {detection.live
+                            ? `LIVE ${Math.round((detection.confidence ?? 0) * 100)}%`
+                            : 'DEMO'}
+                        </small>
                       </li>
                     ))}
                   </ul>
@@ -1783,8 +2014,9 @@ export default function AlertApp() {
           <footer className="integration-footer">
             <span>Detection status</span>
             <p>
-              Sound and phrase tests on this screen are simulated. Connect a classification and
-              speech-processing engine to use these rules with live audio.
+              Tests on this screen are simulated. While listening, sounds marked “live detection”
+              are recognised by the Alert backend ({API_STATUS_HINT[backendStatus]}). Phrases still
+              need a speech-processing integration.
             </p>
           </footer>
         </main>
@@ -1831,13 +2063,55 @@ export default function AlertApp() {
                 type="button"
                 className="secondary-action"
                 onClick={() => {
-                  localStorage.removeItem(ACCOUNT_KEY)
-                  setAccount(null)
                   setDialog(null)
+                  if (auth) {
+                    auth.logout()
+                    return
+                  }
+                  localStorage.removeItem(ACCOUNT_KEY)
+                  setLocalAccount(null)
                 }}
               >
                 Log out
               </button>
+            </div>
+          ) : auth ? (
+            // Real sign-in: Auth0's hosted page handles passwords, Google and sign-up securely.
+            <div className="account-form">
+              <div className="provider-options" aria-label="Sign-in providers">
+                <button type="button" disabled={auth.loading} onClick={() => auth.login('google')}>
+                  <GoogleIcon />
+                  <span>
+                    <b>Continue with Google</b>
+                    <small>Secure sign-in with Auth0</small>
+                  </span>
+                </button>
+              </div>
+              <div className="provider-divider">
+                <span>or use email</span>
+              </div>
+              <button
+                className="primary-action"
+                type="button"
+                disabled={auth.loading}
+                onClick={() => auth.login(accountMode === 'create' ? 'create' : 'login')}
+              >
+                {auth.loading
+                  ? 'Checking sign-in…'
+                  : accountMode === 'create'
+                    ? 'Create account with email'
+                    : 'Continue with email'}
+              </button>
+              <button
+                className="text-action"
+                type="button"
+                onClick={() => setAccountMode((mode) => (mode === 'login' ? 'create' : 'login'))}
+              >
+                {accountMode === 'login' ? 'Create an account' : 'Already have an account? Log in'}
+              </button>
+              <p className="form-disclaimer">
+                You&apos;ll finish signing in on Auth0&apos;s secure page, then return here.
+              </p>
             </div>
           ) : (
             <form className="account-form" onSubmit={accountSubmit}>
@@ -1891,7 +2165,8 @@ export default function AlertApp() {
                 {accountMode === 'login' ? 'Create an account' : 'Already have an account? Log in'}
               </button>
               <p className="form-disclaimer">
-                Local preview account. Production identity integration is not connected.
+                Local preview account (no real sign-in). Add the Auth0 settings to .env.local to
+                enable secure login.
               </p>
             </form>
           )}
@@ -1917,6 +2192,7 @@ export default function AlertApp() {
               State name
               <input
                 value={stateDraft.name}
+                maxLength={60}
                 onChange={(event) => setStateDraft({ ...stateDraft, name: event.target.value })}
                 placeholder="Information"
                 required
@@ -1988,6 +2264,7 @@ export default function AlertApp() {
               <input
                 autoFocus
                 value={phraseDraft}
+                maxLength={80}
                 onChange={(event) => setPhraseDraft(event.target.value)}
                 placeholder="Watch out"
               />
@@ -1999,5 +2276,68 @@ export default function AlertApp() {
         </div>
       )}
     </div>
+  )
+}
+
+/** Connects Auth0's login state to the app and to API calls. Rendered only when Auth0 is configured. */
+function Auth0Bridge() {
+  const { isLoading, isAuthenticated, user, loginWithRedirect, logout, getAccessTokenSilently } =
+    useAuth0()
+  // Layout effect: runs before the app's own effects, so they already see the right token getter.
+  useLayoutEffect(() => {
+    setAccessTokenGetter(async () =>
+      isAuthenticated ? ((await getAccessTokenSilently()) ?? null) : null,
+    )
+  }, [isAuthenticated, getAccessTokenSilently])
+  const auth = useMemo<RealAuth>(
+    () => ({
+      loading: isLoading,
+      user:
+        isAuthenticated && user?.sub
+          ? {
+              id: user.sub,
+              name: user.name || user.nickname || user.email || 'Account',
+              email: user.email || '',
+            }
+          : null,
+      login: (mode) =>
+        void loginWithRedirect({
+          authorizationParams:
+            mode === 'create'
+              ? { screen_hint: 'signup' }
+              : mode === 'google'
+                ? { connection: 'google-oauth2' }
+                : {},
+        }),
+      // Trailing slash matches the URLs Auth0's setup screen registers (it compares exactly).
+      logout: () => void logout({ logoutParams: { returnTo: `${window.location.origin}/` } }),
+    }),
+    [isAuthenticated, isLoading, loginWithRedirect, logout, user],
+  )
+  return <AlertApp auth={auth} />
+}
+
+export default function AlertAppRoot() {
+  // Auth0 needs `window`, so it starts after the first client render.
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => setMounted(true), [])
+  if (!AUTH0_ENABLED) return <AlertApp auth={null} />
+  if (!mounted) return null
+  return (
+    <Auth0Provider
+      domain={AUTH0_CONFIG.domain}
+      clientId={AUTH0_CONFIG.clientId}
+      authorizationParams={{
+        redirect_uri: `${window.location.origin}/`,
+        audience: AUTH0_CONFIG.audience, // must equal the backend's AUTH0_AUDIENCE
+        scope: 'openid profile email offline_access',
+      }}
+      // Keeps users signed in across reloads (browsers block Auth0's cookie-based silent login).
+      cacheLocation="localstorage"
+      useRefreshTokens
+      useRefreshTokensFallback
+    >
+      <Auth0Bridge />
+    </Auth0Provider>
   )
 }

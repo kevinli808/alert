@@ -31,7 +31,7 @@ class SoundCategory:
     display_name: str
     yamnet_labels: tuple[str, ...]
     priority: Priority
-    default_color: str  # suggestion only; each user's own colour lives in alert_preferences
+    default_color: str  # informational only; the app's colours come from the user's settings
     default_flash_speed: int  # flashes per second (1-3)
 
 

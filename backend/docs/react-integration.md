@@ -59,12 +59,12 @@ export function makeApi(getAccessTokenSilently) {
   return {
     me: () => request("/api/users/me"),
     soundTypes: () => fetch(`${API_URL}/api/sound-types`).then((r) => r.json()),
-    getPreferences: () => request("/api/preferences"),
-    putPreferences: (preferences) =>
-      request("/api/preferences", {
+    getSettings: () => request("/api/settings"),
+    putSettings: (settings) =>
+      request("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ preferences }),
+        body: JSON.stringify({ settings }),
       }),
     history: (params = {}) => request(`/api/alert-history?${new URLSearchParams(params)}`),
     clearHistory: () => request("/api/alert-history", { method: "DELETE" }),
@@ -165,22 +165,23 @@ export function useSoundMonitor(api, onDetection) {
 }
 ```
 
-## 4. Show the alert with the user's own colour
+## 4. Show the alert with the user's own settings
 
-The backend returns only the sound type. Colours come from the user's preferences.
+The backend returns only the sound type. What happens next is decided by the **frontend's settings
+model**: each sound rule points at a visual state (default / warning / urgent or a custom state with
+its own colour and duration) plus extra effects such as vibration. The backend stores that settings
+document unchanged per user (`GET`/`PUT /api/settings`) and does not interpret it.
 
-```jsx
-const prefs = await api.getPreferences();                     // load once, refresh after PUT
-const byType = Object.fromEntries(prefs.preferences.map((p) => [p.sound_type, p]));
-
+```js
+// Backend category id -> frontend rule id (see BACKEND_SOUND_TO_RULE in src/lib/alert-api.ts)
 function onDetection(result) {
-  const pref = byType[result.sound_type];
-  if (!pref?.enabled) return;
-  showFlash({ color: pref.color, flashesPerSecond: pref.flash_speed, label: result.sound_type });
+  if (!result.detected || !result.is_new_event) return;
+  const ruleId = BACKEND_SOUND_TO_RULE[result.sound_type];
+  if (ruleId) triggerRule(ruleId);          // applies the rule's visual state + effects
 }
 ```
 
-- `flash_speed` is in flashes per second and is limited to 1–3 (WCAG 2.3.1). Do not flash faster.
+- If you add flashing effects later, keep them at 3 flashes per second or fewer (WCAG 2.3.1).
 - Respect `prefers-reduced-motion`: offer a solid colour plus a text banner instead of flashing.
 - Always show **text** (for example "Fire alarm detected") as well as the colour. Colour alone fails colour-blind users.
 - On `is_new_event: false`, keep the current alert visible. Do not restart it.

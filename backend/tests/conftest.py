@@ -84,7 +84,7 @@ def make_token(rsa_key):
 class InMemoryDatabase(Database):
     def __init__(self) -> None:
         self.profiles: dict[str, dict[str, Any]] = {}
-        self.preferences: dict[tuple[str, str], dict[str, Any]] = {}
+        self.settings: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
 
     async def get_profile(self, user_id):
@@ -95,14 +95,14 @@ class InMemoryDatabase(Database):
             user_id, {"id": user_id, "email": email, "username": username, "created_at": datetime.now(timezone.utc)}
         )
 
-    async def list_preferences(self, user_id):
-        return [dict(p) for (uid, _), p in sorted(self.preferences.items()) if uid == user_id]
+    async def get_settings(self, user_id):
+        row = self.settings.get(user_id)
+        return dict(row) if row else None
 
-    async def upsert_preferences(self, user_id, preferences):
+    async def upsert_settings(self, user_id, settings):
         assert user_id in self.profiles, "FK violation: profile must exist"
-        for p in preferences:
-            self.preferences[(user_id, p["sound_type"])] = {**p, "updated_at": datetime.now(timezone.utc)}
-        return await self.list_preferences(user_id)
+        self.settings[user_id] = {"settings": settings, "updated_at": datetime.now(timezone.utc)}
+        return dict(self.settings[user_id])
 
     async def insert_alert_history(self, user_id, sound_type, confidence, detected_at):
         assert user_id in self.profiles, "FK violation: profile must exist"

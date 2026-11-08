@@ -21,7 +21,11 @@ class Settings(BaseSettings):
     environment: Literal["development", "production", "test"] = "development"
     log_level: str = "INFO"
     # Comma-separated list of allowed frontend origins (no wildcards in production).
-    cors_origins: str = "http://localhost:3000,http://localhost:5173"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173"
+    # Local development only: when Auth0 is NOT configured, let /api/detect-sound run without a token
+    # (as one shared anonymous user, with no history saved) so the frontend works before Auth0 is set up.
+    # Ignored in test/production and whenever Auth0 is configured.
+    allow_anonymous_detection: bool = True
 
     # --- Auth0 ---------------------------------------------------------------------
     auth0_domain: str = ""  # e.g. "your-tenant.us.auth0.com" (no scheme, no trailing slash)
@@ -79,6 +83,10 @@ class Settings(BaseSettings):
     @property
     def auth0_configured(self) -> bool:
         return bool(self.auth0_domain and self.auth0_audience)
+
+    @property
+    def anonymous_detection_enabled(self) -> bool:
+        return self.allow_anonymous_detection and self.environment == "development" and not self.auth0_configured
 
     @property
     def supabase_configured(self) -> bool:
