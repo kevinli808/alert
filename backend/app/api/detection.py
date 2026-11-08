@@ -78,6 +78,17 @@ async def detect_sound(
     outcome = await run_in_threadpool(services.detection.detect, data, user.user_id)
     del data  # raw audio is never persisted or logged; detections are not stored either
 
+    # Labels and scores only (never audio): enough to see why a sound did or didn't trigger.
+    if outcome.candidates and (outcome.detected or outcome.candidates[0][1] >= 0.2):
+        logger.info(
+            "chunk: %s %s (%.2f) | categories %s | model %s",
+            "DETECTED" if outcome.detected else "below threshold:",
+            outcome.sound_type,
+            outcome.confidence,
+            ", ".join(f"{k}={v:.2f}" for k, v in outcome.candidates[:3]),
+            ", ".join(f"{k}={v:.2f}" for k, v in outcome.top_labels[:3]),
+        )
+
     return _to_response(outcome)
 
 

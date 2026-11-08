@@ -63,7 +63,9 @@ SOUND_CATEGORIES: tuple[SoundCategory, ...] = (
         "phone_ringing", "Phone ringing", ("Telephone bell ringing", "Ringtone", "Telephone"), "normal", "#00C853", 1
     ),
     SoundCategory("alarm_clock", "Alarm clock", ("Alarm clock",), "normal", "#00BCD4", 1),
-    SoundCategory("dog_barking", "Dog barking", ("Bark",), "normal", "#8B4513", 1),
+    SoundCategory(
+        "dog_barking", "Dog barking", ("Bark", "Dog", "Bow-wow", "Yip", "Howl", "Growling"), "normal", "#8B4513", 1
+    ),
 )
 
 CATEGORY_BY_ID: dict[str, SoundCategory] = {c.id: c for c in SOUND_CATEGORIES}

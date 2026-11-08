@@ -1,7 +1,7 @@
 """Turns raw classifier scores into an alert decision.
 
 Responsibilities:
-  * Confidence threshold (global, with optional per-category overrides). The 0.75 default is an
+  * Confidence threshold (global, with optional per-category overrides). The 0.6 default is an
     EXPERIMENTAL starting point — calibrate it with scripts/evaluate_model.py on real recordings.
   * Choosing one category when several pass (critical sounds win over normal ones).
   * Event grouping / cooldown: while the same sound keeps being detected for a user, every chunk
@@ -22,6 +22,15 @@ from typing import Callable, Literal
 from app.core.errors import InferenceError
 from app.services import sound_categories as sc
 from app.services.sound_classifier import ClassificationResult
+
+# Quiet "normal" sounds (doorbell, knock, dog, phone...) often score below their threshold when the room
+# is louder than they are. Two weak hits in a row for the same sound still count: a real doorbell or dog
+# repeats, random noise rarely looks like the same sound twice. Measured on ESC-50 clips at -25 dB this
+# caught 15/48 instead of 11/48 with no extra false alarms in 5 min of everyday sounds; applying it to
+# critical/high sounds too added false alarms, so it is limited to "normal" priority.
+WEAK_FRACTION = 0.5  # weak hit = at least half of the category's threshold...
+WEAK_MIN = 0.15  # ...and never below this
+CONFIRM_WINDOW_SECONDS = 5.0  # the two chunks must be consecutive (the browser sends one every 2 s)
 
 Reason = Literal["detected", "below_threshold", "silence"]
 
@@ -92,9 +101,29 @@ class PredictionProcessor:
         self.threshold = threshold
         self.category_thresholds = category_thresholds or {}
         self.events = EventTracker(cooldown_seconds, clock)
+        self._clock = clock
+        self._previous: dict[str, tuple[float, dict[str, float]]] = {}  # user -> (time, last chunk's scores)
+        self._previous_lock = threading.Lock()
 
     def threshold_for(self, sound_type: str) -> float:
         return self.category_thresholds.get(sound_type, self.threshold)
+
+    def _weak_threshold(self, sound_type: str) -> float | None:
+        if sc.CATEGORY_BY_ID[sound_type].priority != "normal":
+            return None
+        return max(WEAK_MIN, self.threshold_for(sound_type) * WEAK_FRACTION)
+
+    def _previous_scores(self, user_id: str, scores: dict[str, float]) -> dict[str, float]:
+        """Remember this chunk and return the previous one if it was consecutive."""
+        now = self._clock()
+        with self._previous_lock:
+            if len(self._previous) > 10_000:
+                self._previous.clear()
+            prev_time, prev = self._previous.get(user_id, (None, {}))
+            self._previous[user_id] = (now, scores)
+        if prev_time is None or now - prev_time > CONFIRM_WINDOW_SECONDS:
+            return {}
+        return prev
 
     def silence(self, timestamp: datetime | None = None) -> DetectionOutcome:
         return DetectionOutcome(
@@ -129,7 +158,15 @@ class PredictionProcessor:
             model=result.model,
         )
 
-        passing = [(k, v) for k, v in ranked if v >= self.threshold_for(k)]
+        previous = self._previous_scores(user_id, scores)
+
+        def passes(cat: str, score: float) -> bool:
+            if score >= self.threshold_for(cat):
+                return True
+            weak = self._weak_threshold(cat)
+            return weak is not None and score >= weak and previous.get(cat, 0.0) >= weak
+
+        passing = [(k, v) for k, v in ranked if passes(k, v)]
         if not passing:
             return DetectionOutcome(
                 detected=False,

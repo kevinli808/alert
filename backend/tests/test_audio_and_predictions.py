@@ -85,12 +85,51 @@ def test_threshold_and_priority():
     p = PredictionProcessor(threshold=0.75, cooldown_seconds=10)
     out = p.process("u", result(doorbell=0.95, fire_alarm=0.8))
     assert out.sound_type == "fire_alarm"  # critical beats normal even with a lower score
-    assert p.process("u", result(doorbell=0.74)).detected is False
+    assert p.process("fresh-user", result(doorbell=0.74)).detected is False
 
 
 def test_per_category_threshold():
     p = PredictionProcessor(threshold=0.75, cooldown_seconds=10, category_thresholds={"glass_breaking": 0.5})
     assert p.process("u", result(glass_breaking=0.55)).sound_type == "glass_breaking"
+
+
+def test_quiet_normal_sound_confirmed_by_two_chunks_in_a_row():
+    clock = Clock()
+    p = PredictionProcessor(threshold=0.6, cooldown_seconds=10, clock=clock,
+                            category_thresholds={"doorbell": 0.4, "fire_alarm": 0.4})
+    assert p.process("u", result(doorbell=0.25)).detected is False  # one weak hit: ignored
+    clock.t = 2
+    out = p.process("u", result(doorbell=0.22))  # second weak hit in a row (>= 0.4 * 0.5)
+    assert out.detected and out.sound_type == "doorbell" and out.is_new_event
+
+
+def test_weak_hits_need_to_be_consecutive_and_same_sound():
+    clock = Clock()
+    p = PredictionProcessor(threshold=0.6, cooldown_seconds=10, clock=clock)
+    p.process("u", result(dog_barking=0.35))
+    clock.t = 8  # more than 5 s later: not consecutive
+    assert p.process("u", result(dog_barking=0.35)).detected is False
+    clock.t = 10
+    assert p.process("u", result(doorbell=0.35)).detected is False  # different sound
+    assert p.process("other", result(dog_barking=0.35)).detected is False  # other user's history
+
+
+def test_weak_rule_is_only_for_normal_priority_sounds():
+    clock = Clock()
+    p = PredictionProcessor(threshold=0.6, cooldown_seconds=10, clock=clock)
+    p.process("u", result(baby_crying=0.4, emergency_siren=0.4))  # high + critical
+    clock.t = 2
+    assert p.process("u", result(baby_crying=0.4, emergency_siren=0.4)).detected is False
+    clock.t = 4
+    assert p.process("u", result(baby_crying=0.4, emergency_siren=0.4, dog_barking=0.0)).detected is False
+
+
+def test_weak_rule_floor():
+    clock = Clock()
+    p = PredictionProcessor(threshold=0.2, cooldown_seconds=10, clock=clock)
+    p.process("u", result(doorbell=0.12))
+    clock.t = 2
+    assert p.process("u", result(doorbell=0.12)).detected is False  # below the 0.15 floor
 
 
 def test_cooldown_groups_continuing_sound():

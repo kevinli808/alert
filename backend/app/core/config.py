@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     min_audio_seconds: float = Field(default=0.5, gt=0)
     max_audio_seconds: float = Field(default=10.0, gt=0, le=60)
     # RMS (linear, full scale = 1.0) below which a chunk is treated as silence and not classified.
-    silence_rms_threshold: float = Field(default=0.003, ge=0, le=1)
+    silence_rms_threshold: float = Field(default=0.001, ge=0, le=1)
 
     # --- Inference -----------------------------------------------------------------
     inference_provider: Literal["local", "databricks"] = Field(
@@ -61,9 +61,17 @@ class Settings(BaseSettings):
     preload_model: bool = Field(default_factory=lambda: not bool(os.getenv("VERCEL")))
 
     # --- Prediction processing ----------------------------------------------------
-    confidence_threshold: float = Field(default=0.75, ge=0, le=1)
+    confidence_threshold: float = Field(default=0.6, ge=0, le=1)
     # Optional JSON object of per-category overrides, e.g. {"glass_breaking": 0.6}
-    category_thresholds: str = ""
+    # Measured on ESC-50 clips in 2 s chunks: 0.6 catches ~70% of real alert sounds (0.75 caught ~54%).
+    # Each override sits just above the worst false alarm measured on 60 everyday-sound clips:
+    # fire/smoke/doorbell/dog/phone/car alarm rarely false-trigger, so they listen harder (phone-speaker
+    # playback scored 0.3-0.5). Keyboard typing reached 0.47 as door_knock and a washing machine 0.66 as
+    # alarm_clock, so those are stricter. A creaking door reached 0.88 as baby_crying (left at 0.6).
+    category_thresholds: str = (
+        '{"fire_alarm":0.4,"smoke_detector":0.4,"alarm_clock":0.7,"doorbell":0.35,'
+        '"dog_barking":0.35,"phone_ringing":0.4,"car_alarm":0.4,"door_knock":0.5}'
+    )
     detection_cooldown_seconds: float = Field(default=10.0, ge=0, le=600)
 
     # --- Databricks ----------------------------------------------------------------

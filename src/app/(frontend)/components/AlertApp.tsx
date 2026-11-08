@@ -1194,6 +1194,7 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
   const pendingRef = useRef<AlertRequest[]>([])
   const [backendStatus, setBackendStatus] = useState<BackendStatus>('checking')
   const triggerRuleRef = useRef<(id: string, live?: { confidence: number }) => void>(() => {})
+  const sustainRuleRef = useRef<(id: string, live: { confidence: number }) => void>(() => {})
   const detectBusyRef = useRef(false)
   const detectPausedUntilRef = useRef(0)
   const micSessionRef = useRef(0)
@@ -1226,10 +1227,13 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
 
   const handleDetection = useCallback((result: DetectionResult) => {
     setBackendStatus('ready')
-    // Only the first chunk of an event triggers an alert; later chunks of the same sound repeat it.
-    if (!result.detected || !result.is_new_event || !result.sound_type) return
+    if (!result.detected || !result.sound_type) return
     const ruleId = BACKEND_SOUND_TO_RULE[result.sound_type]
-    if (ruleId) triggerRuleRef.current(ruleId, { confidence: result.confidence })
+    if (!ruleId) return
+    // The first chunk of an event triggers the alert (vibration included). Later chunks of the same
+    // ongoing sound keep it on screen, so a fire alarm that keeps ringing keeps the screen red.
+    if (result.is_new_event) triggerRuleRef.current(ruleId, { confidence: result.confidence })
+    else sustainRuleRef.current(ruleId, { confidence: result.confidence })
   }, [])
 
   const sendChunk = useCallback(
@@ -1564,10 +1568,45 @@ function AlertApp({ auth }: { auth: RealAuth | null }) {
     },
     [enqueueAlert, rules, statePriority, states],
   )
+  const sustainRule = useCallback(
+    (id: string, live: { confidence: number }) => {
+      // Same sound still going: extend what is already shown instead of re-alerting (no new vibration).
+      const rule = rules.find((item) => item.id === id)
+      if (!rule || !rule.enabled) return
+      const now = Date.now()
+      setDetections((items) =>
+        items.some((item) => item.id === id)
+          ? items.map((item) =>
+              item.id === id ? { ...item, expiresAt: now + 6500, confidence: live.confidence } : item,
+            )
+          : items,
+      )
+      const visualEffect = rule.effects.find((effect) =>
+        states.some((state) => state.id === effect),
+      )
+      if (!visualEffect || visualEffect === 'default') return
+      const current = activeRef.current
+      if (current && current.stateId === visualEffect) {
+        setActiveAlert({
+          ...current,
+          soundNames: current.soundNames.includes(rule.label)
+            ? current.soundNames
+            : [...current.soundNames, rule.label],
+          expiresAt: Math.max(current.expiresAt, now + stateDuration(visualEffect)),
+        })
+      } else {
+        // The alert already ended (or a lower one is showing) while the sound is still going: bring it back.
+        enqueueAlert(visualEffect, rule.label)
+      }
+    },
+    [enqueueAlert, rules, stateDuration, states],
+  )
+
   useEffect(() => {
     // The audio callback lives for the whole mic session; the ref gives it the latest rules/states.
+    sustainRuleRef.current = sustainRule
     triggerRuleRef.current = triggerRule
-  }, [triggerRule])
+  }, [sustainRule, triggerRule])
 
   const addPhrase = () => {
     const label = phraseDraft.trim()

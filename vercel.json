@@ -30,18 +30,6 @@
       }
     },
     {
-      "source": "/api/settings",
-      "destination": {
-        "service": "backend"
-      }
-    },
-    {
-      "source": "/api/alert-history",
-      "destination": {
-        "service": "backend"
-      }
-    },
-    {
       "source": "/health",
       "destination": {
         "service": "backend"
